@@ -1,3 +1,30 @@
+## 0.13.0
+
+### Aggiunto
+
+- **Analisi segnaletica verticale:** verifica dei nodi relativi ai cartelli escursionistici presenti nelle relazioni OSM, controllando tag e ruoli dei membri.
+- **Aggiornamento in iD:** aggiunta massiva dei tag mancanti e dei ruoli vuoti ai nodi interessati, con verifica e salvataggio manuale delle modifiche.
+- **Fotografie Wikimedia Commons:** miniature delle foto dei cartelli, con visualizzazione a schermo intero.
+- **Filtri interattivi:** nella tabella di riepilogo dell'analisi della segnaletica verticale, possibilità di filtrare i nodi: tutti, solo conformi o da verificare.
+- **Indicatori sulla mappa:** pin numerati e selezione dei singoli cartelli.
+
+### Migliorato
+
+- **Interfaccia:** barra e popup più compatti, con supporto ai temi chiaro e scuro.
+- **Stati della segnaletica verticale:** indicatori verde, arancione, rosso e grigio su OSM e WMT.
+- **Analisi geometria:** nuova denominazione e interazione semplificata.
+- **Waymarked Trails:** apertura automatica e persistente del profilo altimetrico.
+- **iD:** accesso diretto senza conferme intermedie.
+- **Navigazione e caricamento:** gestione migliorata dei dati e degli aggiornamenti.
+
+### Corretto
+
+- **Analisi geometrica:** migliorati il rilevamento delle discontinuità, dei segmenti sovrapposti e l'ordinamento delle way.
+- **Allineamento OSM2CAI:** controlli più affidabili sui dati incompleti e sulle date.
+- **Mappa:** corretti indicatori, inquadratura e comportamento dello zoom.
+- **Popup e indicatori:** risolte anomalie di visualizzazione su OSM e WMT.
+- **Navigazione:** corretta la gestione dei caricamenti interrotti e del ritorno alle relazioni precedenti.
+
 ## 0.12.12
 
 ### Aggiunto

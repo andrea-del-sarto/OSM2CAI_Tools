@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         OSM2CAI Tools
 // @namespace    https://osm2cai.cai.it/
-// @version      0.12.12
+// @version      0.13.0
 // @updateURL    https://raw.githubusercontent.com/andrea-del-sarto/OSM2CAI_Tools/main/OSM2CAI_Tools.user.js
 // @downloadURL  https://raw.githubusercontent.com/andrea-del-sarto/OSM2CAI_Tools/main/OSM2CAI_Tools.user.js
 // @homepageURL   https://github.com/andrea-del-sarto/OSM2CAI_Tools
@@ -17,6 +17,8 @@
 // @grant        unsafeWindow
 // @connect      osm2cai.cai.it
 // @connect      api.openstreetmap.org
+// @connect      commons.wikimedia.org
+// @connect      upload.wikimedia.org
 // @run-at       document-start
 // ==/UserScript==
 
@@ -31,7 +33,7 @@
     'use strict';
 
     // La versione visualizzata nel popup proviene dai metadati Tampermonkey.
-    const SCRIPT_VERSION = GM_info?.script?.version || '0.12.12';
+    const SCRIPT_VERSION = GM_info?.script?.version || '0.13.0';
 
     // Accetta esclusivamente una permutazione degli slot way: nessuna aggiunta,
     // rimozione, modifica di ruolo o movimento dei membri node/relation.
@@ -148,8 +150,6 @@
                     stop(); return;
                 }
                 stop();
-                if (!confirm('OSM2CAI: riordinare '+job.before.filter(m=>m.type==='way').length+
-                    ' way nella relazione '+job.relationId+'?\nLa modifica resterà NON salvata in iD e potrà essere annullata.')) return;
                 const remaining = new Map();
                 for (const m of entity.members) {
                     const k=canonical(norm(m));
@@ -167,15 +167,120 @@
                 }
                 captured.perform(graph => graph.replace(graph.entity(rid).update({members:reordered})),
                     'OSM2CAI: riordino membri relazione '+job.relationId);
-                alert('OSM2CAI: ordine applicato nella sessione di iD. Controlla e salva manualmente oppure usa Annulla.');
+                console.info('OSM2CAI: riordino applicato in iD (non salvato su OSM); verifica nella cronologia e salva manualmente.');
             } catch(e) {
                 stop();
                 alert('OSM2CAI: applicazione in iD non riuscita: '+(e?.message||String(e)));
             }
         },500);
     }
+    // Applica correzioni di guidepost al grafo di iD, mai al server OSM.
+    // Verifica la versione di ogni oggetto e impedisce sovrascritture di tag esistenti.
+    function applyGuidepostsInsideID() {
+        const raw=location.hash.match(/(?:^|[&#])osm2cai_guideposts=([^&]+)/)?.[1];
+        if (!raw) return;
+        let job;
+        try {
+            if (raw.length>90000) throw Error('Richiesta troppo grande');
+            job=JSON.parse(decodeURIComponent(raw));
+            if (!job || !/^[1-9]\d{0,15}$/.test(String(job.relationId)) ||
+                !Number.isSafeInteger(Number(job.relationId)) ||
+                !Number.isSafeInteger(job.relationVersion) || job.relationVersion<1 ||
+                !Array.isArray(job.nodes) || job.nodes.length<1 || job.nodes.length>250 ||
+                !Array.isArray(job.roles) || job.roles.length>250) throw Error('Richiesta non valida');
+            const ids=new Set();
+            for (const node of job.nodes) {
+                if (!/^[1-9]\d{0,15}$/.test(String(node.id)) ||
+                    !Number.isSafeInteger(Number(node.id)) || ids.has(String(node.id)) ||
+                    !Number.isSafeInteger(node.version) || node.version<1 ||
+                    !node.add || typeof node.add!=='object' || Array.isArray(node.add) ||
+                    Object.entries(node.add).some(([k,v])=>
+                        !['tourism','information','hiking'].includes(k) ||
+                        ({tourism:'information',information:'guidepost',hiking:'yes'})[k]!==v)) throw Error('Tag non validi');
+                ids.add(String(node.id));
+            }
+            const members=new Set();
+            for (const role of job.roles) {
+                if (!/^[1-9]\d{0,15}$/.test(String(role.id)) ||
+                    !Number.isSafeInteger(Number(role.id)) || !ids.has(String(role.id)) ||
+                    !Number.isSafeInteger(role.index) || role.index<0 || role.index>9999 ||
+                    members.has(role.index)) throw Error('Ruoli non validi');
+                members.add(role.index);
+            }
+        } catch(e) { alert('OSM2CAI: correzione segnaletica non valida: '+e.message); return; }
+        const page=typeof unsafeWindow!=='undefined'?unsafeWindow:window;
+        let captured=null,done=false,attempts=0,timer=null,requestedMissing=false;
+        const stop=()=>{done=true;if(timer!==null) clearInterval(timer);window.removeEventListener('pagehide',stop);};
+        window.addEventListener('pagehide',stop,{once:true});
+        const proxy=api=>{
+            if (!api || typeof api.coreContext!=='function') return api;
+            const facade=Object.assign({},api);
+            facade.coreContext=function(...args){const ctx=api.coreContext.apply(api,args);captured=ctx;return ctx;};
+            return facade;
+        };
+        try {
+            let current=proxy(page.iD);
+            Object.defineProperty(page,'iD',{configurable:true,enumerable:true,
+                get(){return current;},set(v){current=proxy(v);}});
+        } catch(e) {stop();alert('OSM2CAI: impossibile collegarsi a iD.');return;}
+        timer=setInterval(()=>{
+            if(done) return;
+            if(++attempts>240){
+                const missing=job.nodes.filter(n=>!captured?.hasEntity?.('n'+n.id)).map(n=>n.id);
+                stop();alert('OSM2CAI: impossibile preparare le modifiche. '+missing.length+' nodi non caricati da iD ('+missing.slice(0,8).join(', ')+'). Nessuna correzione applicata.');return;}
+            try {
+                if (!captured || typeof captured.hasEntity!=='function' || typeof captured.perform!=='function') return;
+                const relation=captured.hasEntity('r'+job.relationId);
+                if (!relation || !Array.isArray(relation.members)) return;
+                const nodes=job.nodes.map(n=>({spec:n,entity:captured.hasEntity('n'+n.id)}));
+                if(nodes.some(n=>!n.entity)) {
+                    // Le relazioni grandi possono trovarsi fuori dalla vista caricata.
+                    // Richiedi gli oggetti esplicitamente al servizio OSM di iD,
+                    // senza introdurre entità artificiose nel grafo dell'editor.
+                    if (!requestedMissing && attempts>5) {
+                        requestedMissing=true;
+                        const missing=nodes.filter(n=>!n.entity).map(n=>'n'+n.spec.id);
+                        try {
+                            const osm=captured.services?.osm || page.iD?.services?.osm;
+                            if(typeof osm?.loadMultiple==='function') osm.loadMultiple(missing,()=>{});
+                            else if(typeof captured.loadEntity==='function')
+                                for(const id of missing) captured.loadEntity(id);
+                        } catch(err) { console.warn('OSM2CAI: caricamento nodi non riuscito',err); }
+                    }
+                    return;
+                }
+                const bad=Number(relation.version)!==job.relationVersion ||
+                    nodes.some(({spec,entity})=>Number(entity.version)!==spec.version ||
+                        Object.keys(spec.add).some(k=>entity.tags?.[k]!==undefined)) ||
+                    job.roles.some(({id,index})=>{
+                        const member=relation.members[index];
+                        return !member || member.type!=='node' ||
+                            String(member.id??member.ref).replace(/^n/,'')!==String(id) || Boolean(member.role);
+                    });
+                if(bad){stop();alert('OSM2CAI: dati modificati o tag/ruoli già presenti. Nessuna correzione applicata. Ripeti l’analisi.');return;}
+                stop();
+                captured.perform(graph=>{
+                    let next=graph;
+                    for(const {spec} of nodes){
+                        const old=next.entity('n'+spec.id);
+                        next=next.replace(old.update({tags:{...old.tags,...spec.add}}));
+                    }
+                    if(job.roles.length){
+                        const old=next.entity('r'+job.relationId);
+                        const members=old.members.map(m=>({...m}));
+                        for(const {index} of job.roles) members[index].role='guidepost';
+                        next=next.replace(old.update({members}));
+                    }
+                    return next;
+                },'OSM2CAI: correzione segnaletica verticale');
+                console.info('OSM2CAI: correzioni applicate in iD (non salvate su OSM); verifica nella cronologia e salva manualmente.');
+            } catch(e){stop();alert('OSM2CAI: correzione non riuscita: '+(e?.message||String(e)));}
+        },500);
+    }
+
     if (/^\/id(?:\/|$)/i.test(location.pathname)) {
-        applyOrderInsideID();
+        if (location.hash.includes("osm2cai_guideposts=")) applyGuidepostsInsideID();
+        else applyOrderInsideID();
         return;
     }
 
@@ -188,6 +293,9 @@
     let collapsed = localStorage.getItem(COLLAPSED_KEY) === '1';
     let inFlight = new Set();
     let relationIdShown = null;
+    // L'ID mostrato non basta per riutilizzare una barra il cui caricamento
+    // potrebbe essere stato annullato durante una navigazione intermedia.
+    let relationLoad = null;
     let sequence = 0;
     let refreshTimer = null;
     let positionTimer = null;
@@ -196,7 +304,7 @@
     const MEMBER_ROW_HEIGHT = 38;
     const BAR_HEIGHT = MAIN_BAR_HEIGHT + MEMBER_ROW_HEIGHT; // Altezza complessiva della barra
     const RAIL_WIDTH = 34;
-    const BAR_WIDTH = 710; // Larghezza fissa anche durante il caricamento
+    const BAR_WIDTH = 720; // Larghezza fissa anche durante il caricamento
     // Dimensioni costanti: non cambiano in base ai valori delle API.
     const METRIC_WIDTHS = [90, 55, 220, 135, 145];
 
@@ -263,7 +371,7 @@
         if (!Array.isArray(elements) || typeof validationDate !== 'string') { return []; }
         const stamp = validationDate.trim();
         if (!/^\d{4}-\d{2}-\d{2}(?:$|T|\s)/.test(stamp)) { return []; }
-        const ms = Date.parse(stamp);
+        const ms = parseApiDate(stamp);
         if (!Number.isFinite(ms)) { return []; }
         const onlyDay = /^\d{4}-\d{2}-\d{2}$/.test(stamp);
         return elements.filter(item => {
@@ -349,6 +457,7 @@
     // Segnalazioni temporanee indipendenti dai layer Leaflet/OSM.
     // Non usa né modifica oggetti della mappa appartenenti ad altri script.
     let orderMapIssues = [];
+    let selectedGuidepostId = null;
     let orderMapArrows = [];
     let orderMapArrowsVisible = false;
     let orderNestedGeometryVisible = false;
@@ -361,7 +470,6 @@
     // La geometria di base resta quella dell'ultimo frame renderizzato.
     let osmTraceBaseView = null;
     let osmTraceTween = null;
-    let osmTraceInputAnimation = null;
 
     // Il ciclo veloce si attiva soltanto per pan/zoom o cambiamenti della vista.
     // A mappa ferma rimane un controllo leggero per aggiornamenti di URL e layout
@@ -406,6 +514,7 @@
     function clearOrderMap() {
         orderMapVisible = false;
         orderMapIssues = [];
+        selectedGuidepostId = null;
         orderMapArrows = [];
         orderMapArrowsVisible = false;
         orderNestedGeometryVisible = false;
@@ -420,7 +529,7 @@
         wmtCanvasBaseline=null; wmtCanvasBaselineKey=null;
         wmtZoomGesture=null;
         osmZoomGesture=null; osmLastZoom=null;
-        osmTraceBaseView=null; osmTraceTween=null; osmTraceInputAnimation=null;
+        osmTraceBaseView=null; osmTraceTween=null;
 
     }
 
@@ -492,9 +601,10 @@
     // animando lo zoom. Il drag non viene toccato, e non alteriamo i layer OSM.
     const OSM_ZOOM_STABLE_MS = 300;
     const OSM_ZOOM_MAX_MS = 1900;
-    // Anima la geometria all'INIZIO dello zoom, prima che OSM aggiorni #map=.
-    // Non modifica i layer OSM, né il pan già funzionante.
-    function beginOsmZoomGesture(direction=0,clientX=null,clientY=null) {
+    // Segna l'inizio del gesto senza prevedere livelli di zoom: un trackpad
+    // può emettere molti eventi per un solo step. La geometria segue la vista
+    // misurata dalle tessere in orderView(), senza scale cumulative stimate.
+    function beginOsmZoomGesture() {
         if (isWmt() || (!orderMapVisible && !orderMapArrowsVisible)) return;
         const view=orderView();
         if (!view) return;
@@ -506,30 +616,6 @@
             osmZoomGesture.lastInput=now;
             osmZoomGesture.lastChange=now;
         }
-        if (direction && orderNestedGeometryVisible) {
-            const overlay=document.getElementById('osm2cai-order-overlay');
-            const trace=overlay?.querySelector('#osm2cai-nested-geometry');
-            if (trace) {
-                const rect=view.rect;
-                const anchor={x:Number.isFinite(clientX)?clientX-rect.left:rect.width/2,
-                              y:Number.isFinite(clientY)?clientY-rect.top:rect.height/2};
-                // Per gesti ripetuti usa la trasformazione finale del gesto precedente.
-                const current=osmTraceInputAnimation;
-                const base=current && now<current.until ? current.factor : 1;
-                const factor=base*(direction>0?2:0.5);
-                const start=current && now<current.until ? current.factor : 1;
-                trace.style.transformBox='view-box';
-                trace.style.transformOrigin=`${anchor.x}px ${anchor.y}px`;
-                // Il browser vede esplicitamente due stati e interpola il transform.
-                trace.style.transition='none';
-                trace.style.transform=`scale(${start})`;
-                void trace.getBoundingClientRect();
-                trace.style.transition='transform 260ms ease-out';
-                trace.style.transform=`scale(${factor})`;
-                osmTraceInputAnimation={until:now+300, factor, viewKey:view.key};
-                startOrderAnimation(620);
-            }
-        }
         // I pin sono ancorati alla vista geografica: durante l'animazione OSM
         // non devono restare fermi su una posizione precedente.
         const pins=document.querySelector('#osm2cai-order-overlay #osm2cai-map-problems');
@@ -539,24 +625,24 @@
     document.addEventListener('wheel',event=>{
         if (isWmt() || event.ctrlKey || Math.abs(event.deltaY)<1) return;
         const map=findOrderMapElement();
-        if (map?.contains(event.target)) beginOsmZoomGesture(event.deltaY<0?1:-1,event.clientX,event.clientY);
+        if (map?.contains(event.target)) beginOsmZoomGesture();
     },{capture:true,passive:true});
     document.addEventListener('dblclick',event=>{
         if (isWmt()) return;
         const map=findOrderMapElement();
-        if (map?.contains(event.target)) beginOsmZoomGesture(event.shiftKey?-1:1,event.clientX,event.clientY);
+        if (map?.contains(event.target)) beginOsmZoomGesture();
     },true);
     document.addEventListener('click',event=>{
         if (isWmt() || !event.target.closest) return;
         const plus=event.target.closest('.leaflet-control-zoom-in,.ol-zoom-in,[data-testid="zoom-in"]');
         const minus=event.target.closest('.leaflet-control-zoom-out,.ol-zoom-out,[data-testid="zoom-out"]');
-        if (plus || minus) beginOsmZoomGesture(plus?1:-1);
+        if (plus || minus) beginOsmZoomGesture();
     },true);
     document.addEventListener('keydown',event=>{
         if (isWmt() || event.altKey || event.ctrlKey || event.metaKey ||
             /^(INPUT|TEXTAREA|SELECT)$/.test(event.target?.tagName) || event.target?.isContentEditable) return;
         if (['+','=','-','_'].includes(event.key) && findOrderMapElement())
-            beginOsmZoomGesture(['+','='].includes(event.key)?1:-1);
+            beginOsmZoomGesture();
     },true);
     function wmtCanvasFrame(map) {
         if (!isWmt() || typeof DOMMatrix === 'undefined') return null;
@@ -787,20 +873,6 @@
         // Il canvas può essere sostituito da OpenLayers (cambio layer o tile).
         // Se cambia elemento, riparti da un nuovo riferimento senza usare
         // trasformazioni misurate su un canvas non più presente.
-        // Durante l'interpolazione d'ingresso NON ricostruire il path sulla
-        // vista URL vecchia o nuova: conserverebbe la traccia ferma e causerebbe
-        // uno scatto. Al termine riproietta con la vista OSM definitiva.
-        if (!isWmt() && osmTraceInputAnimation) {
-            if (performance.now()<osmTraceInputAnimation.until) {
-                const arrows=overlay?.querySelector('#osm2cai-map-arrows');
-                if (arrows) arrows.style.visibility='hidden';
-                const pins=overlay?.querySelector('#osm2cai-map-problems');
-                if (pins) pins.style.visibility='hidden';
-                return;
-            }
-            osmTraceInputAnimation=null;
-            orderRenderSignature=null;
-        }
         const frameForSignature = isWmt() ? wmtCanvasFrame(view.map) : null;
         const canvasChanged = isWmt() && frameForSignature?.canvas !== orderLastCanvasNode;
         if (canvasChanged) {
@@ -1019,20 +1091,32 @@
         problemLayer.id='osm2cai-map-problems';
         problemLayer.style.visibility=arrowsHidden?'hidden':'visible';
         svg.appendChild(problemLayer);
-        for (const issue of orderMapIssues) {
+        for (const issue of [...orderMapIssues].sort((a,b)=>Number(String(a.id)===String(selectedGuidepostId))-Number(String(b.id)===String(selectedGuidepostId)))) {
             const {x,y}=project(issue);
             if (x < -30 || x > rect.width+30 || y < -30 || y > rect.height+30) continue;
             const group=document.createElementNS(ns,'a');
-            const link='https://www.openstreetmap.org/edit?editor=id#map=18/'+issue.lat.toFixed(6)+'/'+issue.lon.toFixed(6);
+            const link=issue.type==='guidepost' ? 'https://www.openstreetmap.org/node/'+encodeURIComponent(issue.id) : 'https://www.openstreetmap.org/edit?editor=id#map=18/'+issue.lat.toFixed(6)+'/'+issue.lon.toFixed(6);
             group.setAttribute('href',link);group.setAttribute('target','_blank');
             group.setAttribute('rel','noopener noreferrer');
-            group.setAttribute('aria-label','Modifica in iD: '+issue.detail);
+            group.setAttribute('aria-label',(issue.type==='guidepost'?'Segnaletica: ':'Modifica in iD: ')+issue.detail);
+            const title=document.createElementNS(ns,'title');title.textContent=issue.detail;group.appendChild(title);
             group.style.pointerEvents='auto';group.style.cursor='pointer';
+            const selected=issue.type==='guidepost' && String(issue.id)===String(selectedGuidepostId);
+            if(selected){
+                const halo=document.createElementNS(ns,'circle');
+                halo.setAttribute('cx',x);halo.setAttribute('cy',y);
+                halo.setAttribute('r','22');halo.setAttribute('fill','none');
+                halo.setAttribute('stroke','#facc15');halo.setAttribute('stroke-width','6');
+                halo.setAttribute('aria-label','Nodo selezionato sulla mappa');
+                group.appendChild(halo);
+            }
             const circle=document.createElementNS(ns,'circle');
             circle.setAttribute('cx',x);circle.setAttribute('cy',y);
-            circle.setAttribute('r',issue.type==='branch'?'13':issue.type==='overlap'?'14':'12');
-            circle.setAttribute('fill',issue.type==='branch'?'#e9a419':issue.type==='overlap'?'#9333ea':'#e63434');
-            circle.setAttribute('stroke','white');circle.setAttribute('stroke-width','3');
+            circle.setAttribute('r',selected?'16':issue.type==='branch'?'13':issue.type==='overlap'?'14':'12');
+            circle.setAttribute('fill',issue.type==='guidepost'?
+                ({green:'#16845b',orange:'#d97706',red:'#dc2626'}[issue.status] || (issue.valid?'#16845b':'#d97706')):
+                issue.type==='branch'?'#e9a419':issue.type==='overlap'?'#9333ea':'#e63434');
+            circle.setAttribute('stroke','white');circle.setAttribute('stroke-width',selected?'4':'3');
             circle.setAttribute('opacity','.95');
             const label=document.createElementNS(ns,'text');
             label.setAttribute('x',x);label.setAttribute('y',y+4.2);
@@ -1054,7 +1138,7 @@
     // Inquadra la geometria della relazione quando si apre un'analisi con
     // problemi. Nessuna modifica ai layer o ai dati OSM. La mappa viene
     // centrata una sola volta per apertura, non a ogni ridisegno degli SVG.
-    function focusOrderGeometry(full, relationId) {
+    function focusOrderGeometry(full, relationId, popupId = 'order-popover') {
         if (!full || String(relationId)!==String(relationIdFromUrl())) return false;
         if (isWmt()) {
             // WMT legge `map=` dal fragment solo quando crea la mappa, non
@@ -1066,8 +1150,8 @@
             let attempts=0;
             const focusNative = () => {
                 if (String(relationId)!==String(relationIdFromUrl()) ||
-                    !document.getElementById('osm2cai-order-popover') ||
-                    document.getElementById('osm2cai-order-popover').hidden) return;
+                    !document.getElementById('osm2cai-'+popupId) ||
+                    document.getElementById('osm2cai-'+popupId).hidden) return;
                 const panel=[...document.querySelectorAll('.sidepanel')].find(el=>{
                     const rect=el.getBoundingClientRect();
                     return rect.width>150 && rect.height>150 &&
@@ -1087,8 +1171,12 @@
             focusNative();
             return true;
         }
+        // Anche durante il primo caricamento la mappa OSM potrebbe non avere
+        // ancora tessere leggibili o un parametro #map. Per l'inquadratura
+        // bastano comunque le dimensioni del contenitore e il full.json.
         const view=orderView();
-        if (!view || !view.rect.width || !view.rect.height) return false;
+        const mapRect=view?.rect || findOrderMapElement()?.getBoundingClientRect();
+        if (!mapRect || mapRect.width<100 || mapRect.height<100) return false;
         const wayById=new Map((full.elements||[]).filter(e=>e.type==='way').map(e=>[String(e.id),e]));
         const nodeById=new Map((full.elements||[]).filter(e=>e.type==='node').map(e=>[String(e.id),e]));
         const geometry=relationGeometryMembers(full,relationId);
@@ -1113,35 +1201,451 @@
         const dy=Math.abs(mercY(maxLat)-mercY(minLat))/(2*Math.PI);
         const dx=Math.max(0,(maxLon-minLon)/360);
         const padding=70;
-        const usableWidth=Math.max(140,view.rect.width-2*padding);
-        const usableHeight=Math.max(120,view.rect.height-2*padding);
+        const usableWidth=Math.max(140,mapRect.width-2*padding);
+        const usableHeight=Math.max(120,mapRect.height-2*padding);
         const zoom=Math.max(3,Math.min(18,Math.floor(Math.min(
             Math.log2(usableWidth/(256*Math.max(dx,1e-10))),
             Math.log2(usableHeight/(256*Math.max(dy,1e-10)))))));
         if (![lat,lon,zoom].every(Number.isFinite)) return false;
-        // Non spostare la mappa quando la geometria è già interamente visibile
-        // con un margine ragionevole; evita cambi di zoom inutili.
-        const currentScale=256*2**view.zoom;
-        const mercCenter=mercY(view.lat);
-        const projected=[
-            [minLat,minLon],[minLat,maxLon],[maxLat,minLon],[maxLat,maxLon]
-        ].map(([a,b])=>({x:view.rect.width/2+(b-view.lon)/360*currentScale,
-            y:view.rect.height/2-(mercY(a)-mercCenter)/(2*Math.PI)*currentScale}));
-        const inside=projected.every(p=>p.x>=padding&&p.x<=view.rect.width-padding&&
-            p.y>=padding&&p.y<=view.rect.height-padding);
-        const centerShift=Math.hypot((lon-view.lon)/360*currentScale,
-            (mercY(lat)-mercCenter)/(2*Math.PI)*currentScale);
-        if (inside && centerShift<Math.min(view.rect.width,view.rect.height)*0.12) return false;
-        // Se l'intera geometria è già visibile, centra senza forzare un nuovo
-        // zoom: evita una variazione di scala non richiesta.
-        const fitZoom=inside ? Math.max(3,Math.min(18,Math.round(view.zoom))) : zoom;
-        const mapHash=`${fitZoom}/${lat.toFixed(5)}/${lon.toFixed(5)}`;
-        // OSM riconosce #map e aggiorna Leaflet senza ricaricare la pagina.
-        // Su WMT la vista viene invece inquadrata dal comando nativo sopra.
-        const other=location.hash.replace(/^#/, '').split('&').slice(1).filter(p=>!p.startsWith('map='));
-        location.hash='map='+mapHash+(other.length?'&'+other.join('&'):'');
+        // Il comando Analisi geometria deve eseguire lo stesso zoom esplicito
+        // dell'azione nativa di WMT, anche se il tracciato risulta gia' visibile.
+        // Non dipendere dalla posizione iniziale e non scartare parametri hash.
+        const mapHash=`${zoom}/${lat.toFixed(5)}/${lon.toFixed(5)}`;
+        const other=location.hash.replace(/^#/, '').split('&')
+            .filter(part=>part && !part.startsWith('map='));
+        const targetHash='map='+mapHash+(other.length?'&'+other.join('&'):'');
+        if (location.hash.slice(1)!==targetHash) location.hash=targetHash;
         startOrderAnimation(1000);
         return true;
+    }
+
+    // Restituisce solo veri file di Commons: wikimedia_commons può indicare
+    // anche una categoria, dalla quale non è possibile ricavare una singola foto.
+    function guidepostCommonsFile(value) {
+        if (typeof value !== 'string') return null;
+        let name=value.trim();
+        if (!name || name.length>500) return null;
+        const urlMatch=name.match(/^https:\/\/commons\.wikimedia\.org\/wiki\/(File|Image):(.+)$/i);
+        if (urlMatch) {
+            try { name='File:'+decodeURIComponent(urlMatch[2]).replace(/_/g,' '); }
+            catch (_) { return null; }
+        }
+        if (!/^(?:File|Image):/i.test(name)) return null;
+        name=name.replace(/^(?:File|Image):/i,'').trim();
+        if (!name || /[\x00-\x1f\x7f#?]/.test(name) || name.includes('/') || name.includes('\\')) return null;
+        return name;
+    }
+
+    function guidepostCommonsImageUrl(name, width) {
+        // Endpoint Wikimedia per riutilizzare file: diversamente dall'URL thumbnail
+        // costruito a mano, il redirect conosce il file effettivamente pubblicato.
+        const params=new URLSearchParams({title:'Special:Redirect/file/'+name.replace(/ /g,'_')});
+        if(width) params.set('width',String(width));
+        return 'https://commons.wikimedia.org/w/index.php?'+params;
+    }
+
+    const commonsImageCache=new Map();
+    function guidepostCommonsInfo(name) {
+        if(commonsImageCache.has(name)) return commonsImageCache.get(name);
+        // URL canonicali ricavati dalla MediaWiki Action API (imageinfo).
+        const params=new URLSearchParams({action:'query',format:'json',formatversion:'2',
+            prop:'imageinfo',iiprop:'url|mime',iiurlwidth:'400',
+            titles:'File:'+name,origin:'*'});
+        const promise=new Promise(resolve=>{
+            let settled=false;
+            const finish=value=>{if(!settled){settled=true;resolve(value);}};
+            try {
+                GM_xmlhttpRequest({method:'GET',url:'https://commons.wikimedia.org/w/api.php?'+params,
+                    timeout:12000,
+                    onload:r=>{
+                        try {
+                            if(r.status<200||r.status>=300) return finish(null);
+                            const data=JSON.parse(r.responseText);
+                            const item=data?.query?.pages?.[0]?.imageinfo?.[0];
+                            const valid=url=>{
+                                try {const u=new URL(url);return u.protocol==='https:' &&
+                                    (u.hostname==='upload.wikimedia.org'||u.hostname==='commons.wikimedia.org');}
+                                catch(_){return false;}
+                            };
+                            finish(item&&valid(item.url)?{
+                                thumbnail:valid(item.thumburl)?item.thumburl:item.url,
+                                original:item.url
+                            }:null);
+                        } catch(_) {finish(null);}
+                    },onerror:()=>finish(null),ontimeout:()=>finish(null)});
+            } catch(_) {finish(null);}
+        });
+        commonsImageCache.set(name,promise);
+        return promise;
+    }
+
+    // Fonti successive solo in caso di errore di caricamento.
+    function guidepostSetImageSources(img, urls, onFail) {
+        const sources=[...new Set(urls.filter(Boolean))];
+        let index=0;
+        img.onerror=()=>{
+            if(index<sources.length) img.src=sources[index++];
+            else {img.onerror=null;onFail?.();}
+        };
+        if(index<sources.length) img.src=sources[index++];
+        else onFail?.();
+    }
+
+    let guidepostLightbox=null;
+    function closeGuidepostLightbox() {
+        if (!guidepostLightbox) return;
+        const {overlay,onKey}=guidepostLightbox;
+        document.removeEventListener('keydown',onKey,true);
+        overlay.remove();
+        guidepostLightbox=null;
+    }
+    function openGuidepostLightbox(name) {
+        closeGuidepostLightbox();
+        const overlay=document.createElement('div');
+        overlay.id='osm2cai-guidepost-lightbox';
+        overlay.setAttribute('role','dialog');
+        overlay.setAttribute('aria-modal','true');
+        overlay.setAttribute('aria-label','Fotografia Wikimedia Commons');
+        overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.9);z-index:2147483646;display:flex;align-items:center;justify-content:center;padding:38px 16px;box-sizing:border-box;cursor:zoom-out;';
+        const img=document.createElement('img');
+        img.alt='Fotografia Wikimedia Commons: '+name;
+        img.style.cssText='display:block;max-width:100%;max-height:100%;object-fit:contain;cursor:default;';
+        img.addEventListener('click',event=>event.stopPropagation());
+        const close=document.createElement('button');
+        close.type='button';close.textContent='×';close.setAttribute('aria-label','Chiudi fotografia');
+        close.style.cssText='position:absolute;top:9px;right:14px;border:0;background:transparent;color:white;font:32px system-ui;cursor:pointer;';
+        close.addEventListener('click',closeGuidepostLightbox);
+        overlay.addEventListener('pointerdown',event=>event.stopPropagation());
+        overlay.addEventListener('click',event=>{event.stopPropagation();if(event.target===overlay)closeGuidepostLightbox();});
+        const onKey=event=>{if(event.key==='Escape'){event.preventDefault();event.stopPropagation();closeGuidepostLightbox();}};
+        document.addEventListener('keydown',onKey,true);
+        overlay.append(img,close);
+        document.body.appendChild(overlay);
+        guidepostCommonsInfo(name).then(info=>{
+            if(!overlay.isConnected) return;
+            guidepostSetImageSources(img,[info?.original,guidepostCommonsImageUrl(name)],()=>{
+                img.alt='Impossibile caricare la fotografia Wikimedia Commons';
+            });
+        });
+        guidepostLightbox={overlay,onKey};
+        close.focus();
+    }
+
+    // Solo membri diretti: non attribuire alla radice i ruoli delle sottorelazioni.
+    function guidepostAnalysis(full, relationId) {
+        const elements=full?.elements||[];
+        const relation=elements.find(e=>e.type==='relation' && String(e.id)===String(relationId));
+        if (!relation) return null;
+        const nodes=new Map(elements.filter(e=>e.type==='node').map(e=>[String(e.id),e]));
+        const grouped=new Map();
+        for (const member of relation.members||[]) {
+            const node=member.type==='node'?nodes.get(String(member.ref)):null;
+            // Individua i guidepost esclusivamente dai due tag del nodo,
+            // indipendentemente dal ruolo assegnato al membro della relazione.
+            if (member.type!=='node' || node?.tags?.information!=='guidepost' ||
+                node.tags.tourism!=='information') continue;
+            const key=member.type+'/'+member.ref;
+            if (!grouped.has(key)) grouped.set(key,{id:member.ref,type:member.type,node,roles:[]});
+            grouped.get(key).roles.push(member.role||'');
+        }
+        return [...grouped.values()].map(item=>{
+            const checks=[['tourism','information'],['information','guidepost'],['hiking','yes']].map(([key,expected])=>({key,expected,value:item.node?.tags?.[key],ok:item.node?.tags?.[key]===expected}));
+            const missing=item.type==='node' && !item.node;
+            const valid=item.type==='node' && !missing && checks.every(c=>c.ok) && item.roles.every(role=>role==='guidepost') && item.roles.length===1;
+            // Una mancanza correggibile e' arancione; un valore esplicitamente
+            // errato o un membro duplicato e' rosso. La stessa classificazione
+            // viene usata per i pin su WMT e su OpenStreetMap.
+            const definiteError=item.roles.length!==1 || checks.some(c=>c.value!==undefined && !c.ok) ||
+                item.roles.some(role=>role!=='' && role!=='guidepost');
+            const status=valid?'green':definiteError?'red':'orange';
+            return {...item,checks,missing,valid,status};
+        });
+    }
+
+    function updateGuidepostIndicator(full, relationId) {
+        const dot=$('guidepost-dot');
+        if (!dot) return;
+        const rows=guidepostAnalysis(full,relationId);
+        // Priorità: rosso > arancione > verde; grigio quando non sono stati
+        // individuati guidepost nella relazione (o i dati non sono disponibili).
+        // Stessa funzione per OSM e Waymarked Trails.
+        const state=!rows || rows.length===0 ? 'gray' :
+            rows.some(r=>r.status==='red') ? 'red' :
+            rows.some(r=>r.status==='orange') ? 'orange' : 'green';
+        const colors={gray:'#94a3b8',green:'#22c55e',red:'#ef4444',orange:'#f59e0b'};
+        // Un cerchio SVG reale evita che OSM nasconda gli span vuoti o
+        // ne sovrascriva il colore di sfondo. Aggiorniamo l'attributo SVG,
+        // non il background CSS di un elemento vuoto.
+        const circle=dot.querySelector('circle');
+        if (circle) {
+            circle.setAttribute('fill',colors[state]);
+            circle.style.setProperty('fill',colors[state],'important');
+            circle.style.setProperty('display','block','important');
+            circle.style.setProperty('visibility','visible','important');
+            circle.style.setProperty('opacity','1','important');
+        }
+        dot.style.setProperty('display','block','important');
+        dot.style.setProperty('visibility','visible','important');
+        dot.style.setProperty('opacity','1','important');
+        dot.title=!rows?'Analisi segnaletica non disponibile':
+            rows.length===0?'Nessun nodo di segnaletica presente nella relazione':
+            state==='green'?'Tutti i nodi della segnaletica sono conformi':
+            state==='orange'?'Segnaletica da completare: tag hiking=yes o ruolo guidepost mancante':
+            'Segnaletica con errori: valori non conformi, ruoli errati o membri duplicati';
+        $('guidepost-button')?.setAttribute('aria-label','Analisi segnaletica — '+dot.title);
+    }
+
+    function closeGuidepostPopover() {
+        closeGuidepostLightbox();
+        const popup=$('guidepost-popover');
+        if (popup) {
+            popup.hidden=true;
+            popup.style.setProperty('display','none','important');
+        }
+        $('guidepost-button')?.setAttribute('aria-expanded','false');
+        if (orderMapIssues.some(issue=>issue.type==='guidepost')) clearOrderMap();
+        selectedGuidepostId=null;
+    }
+
+    function renderGuidepostAnalysis() {
+        const output=$('guidepost-results');
+        if (!output) return;
+        output.replaceChildren();
+        // Ogni nuova apertura inizia senza alcun guidepost selezionato.
+        selectedGuidepostId=null;
+        const rows=guidepostAnalysis(orderFull,orderRelationId);
+        if (!rows) {
+            output.textContent='Dati OSM non disponibili. Attendi il caricamento; se non riesce, riapri la barra per riprovare.';
+            return;
+        }
+        const add=(parent,tag,text)=>{const el=document.createElement(tag);el.textContent=text;parent.appendChild(el);return el;};
+        const correct=rows.filter(r=>r.valid).length;
+        // Ogni nodo non conforme, inclusi i dati mancanti, è nel filtro da verificare.
+        const summary=add(output,'div','');
+        summary.style.cssText='display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin:8px 0 12px;';
+        let activeGuidepostFilter='all';
+        const filters=[
+            {key:'all',label:`${rows.length} totale`,color:'inherit'},
+            {key:'valid',label:`✓ ${correct} ${correct===1?'conforme':'conformi'}`,color:'#16845b'},
+            {key:'invalid',label:`⚠ ${rows.length-correct} da verificare`,color:'#b45c2b'}
+        ];
+        const filterButtons=new Map();
+        let applyGuidepostFilter=()=>{};
+        filters.forEach((filter,index)=>{
+            if(index) add(summary,'span','|').style.cssText='opacity:.45;user-select:none;';
+            const button=add(summary,'button',filter.label);
+            button.type='button';button.style.cssText='background:transparent;border:0;border-radius:3px;padding:2px 1px;font:600 12px system-ui,sans-serif;cursor:pointer;color:'+filter.color+';';
+            button.setAttribute('aria-label','Mostra '+(filter.key==='all'?'tutti i nodi':filter.key==='valid'?'solo i conformi':'solo i nodi da verificare'));
+            filterButtons.set(filter.key,button);
+            button.addEventListener('click',()=>{activeGuidepostFilter=filter.key;applyGuidepostFilter();});
+        });
+        if (!rows.length) {add(output,'p','Nessun nodo membro con tourism=information e information=guidepost.');styleGuidepostPopover();focusOrderGeometry(orderFull,orderRelationId,'guidepost-popover');return;}
+        // Correzione massiva: aggiungi solo tag assenti e ruoli vuoti.
+        // Non modificare tag discordanti, membri non-node o duplicati.
+        const rel=orderFull.elements.find(e=>e.type==='relation' && String(e.id)===String(orderRelationId));
+        const edits=[],roles=[];
+        for(const row of rows){
+            if(row.type!=='node' || !row.node || !Number.isSafeInteger(row.node.version) ||
+                row.roles.length!==1 || !Number.isSafeInteger(Number(row.id))) continue;
+            const addTags={};
+            for(const check of row.checks) if(check.value===undefined) addTags[check.key]=check.expected;
+            if(Object.keys(addTags).length) edits.push({id:String(row.id),version:row.node.version,add:addTags});
+            if(row.roles[0]===''){
+                const index=rel?.members?.findIndex(m=>m.type==='node' && String(m.ref)===String(row.id));
+                if(index>=0) roles.push({id:String(row.id),index});
+            }
+        }
+        // Ruolo mancante su nodo senza tag da inserire: includi il nodo nel preflight.
+        for(const role of roles){
+            if(!edits.some(e=>e.id===role.id)){
+                const row=rows.find(r=>String(r.id)===role.id);
+                edits.push({id:role.id,version:row.node.version,add:{}});
+            }
+        }
+        const pins=rows.filter(r=>Number.isFinite(r.node?.lat)&&Number.isFinite(r.node?.lon)).map(r=>({
+            type:'guidepost',id:r.id,lat:r.node.lat,lon:r.node.lon,valid:r.valid,status:r.status,label:String(rows.indexOf(r)+1),
+            detail:`${r.node.tags?.name||r.node.tags?.ref||'Nodo '+r.id} — ${r.status==='green'?'conforme':r.status==='red'?'errore':'da completare'}`
+        }));
+        const list=add(output,'div','');
+        list.style.cssText='max-height:min(240px,34vh);overflow:auto;overscroll-behavior:contain;position:relative;';
+        const table=add(list,'table','');table.className='oc-guidepost-table';
+        table.style.cssText='width:100%;min-width:0;border-collapse:separate;border-spacing:0;table-layout:fixed;font:12px/1.25 system-ui,sans-serif;color:inherit;';
+        // Intestazione a due livelli: ID nodo | Tag (quattro sottocolonne) | Ruolo membro.
+        // Il colgroup governa le larghezze senza attribuirle alla cella Tag con colspan.
+        const widths=[23,13,18,12,18,16];
+        const colgroup=add(table,'colgroup','');
+        widths.forEach(width=>{
+            const col=add(colgroup,'col','');
+            col.style.width=width+'%';
+        });
+        const thead=add(table,'thead','');
+        const groupRow=add(thead,'tr','');
+        const osmHead=add(groupRow,'th','ID nodo');
+        osmHead.scope='col';osmHead.rowSpan=2;
+        const tagHead=add(groupRow,'th','Tag');
+        tagHead.scope='colgroup';tagHead.colSpan=4;
+        const roleHead=add(groupRow,'th','');
+        roleHead.replaceChildren(document.createTextNode('Ruolo'),document.createElement('br'),document.createTextNode('membro'));
+        roleHead.scope='col';roleHead.rowSpan=2;
+        const tagsRow=add(thead,'tr','');
+        ['tourism','information','hiking','wikimedia_commons'].forEach((label,index)=>{
+            const cell=add(tagsRow,'th',index===3?'':label);cell.scope='col';
+            if(index===3) cell.replaceChildren(document.createTextNode('wikimedia'),document.createElement('br'),document.createTextNode('commons'));
+        });
+        // Intestazione fissa, con due livelli distinti durante lo scorrimento.
+        for(const cell of thead.querySelectorAll('th')){
+            const secondLevel=cell.parentElement===tagsRow;
+            cell.style.cssText='position:sticky;z-index:3;box-sizing:border-box;padding:2px 1px;'+
+                'background:#eff3f3;color:inherit;border-bottom:1px solid #8797ac88;'+
+                'text-align:center;vertical-align:middle;overflow-wrap:normal;'+
+                'font:600 '+(cell.textContent==='wikimediacommons'?'10':'12')+'px/1.25 system-ui,sans-serif;'+
+                'height:'+(secondLevel?'34':'24')+'px;top:'+(secondLevel?'24':'0')+'px;';
+        }
+        for(const cell of [osmHead,roleHead]) cell.style.height='58px';
+        // Linee verticali sottili distinguono la colonna ID e il ruolo dai quattro tag.
+        tagHead.style.borderLeft='1px solid #8797ac55';
+        roleHead.style.borderLeft='1px solid #8797ac55';
+        const body=add(table,'tbody','');
+        // Anteprima esterna al contenitore con scroll: sempre sotto la tabella.
+        const photoArea=add(output,'div','');
+        photoArea.className='oc-guidepost-photo';
+        photoArea.hidden=true;
+        photoArea.style.cssText='margin:10px 0 2px;text-align:center;';
+        let photoRequest=0;
+        const showGuidepostPhoto=row=>{
+            const request=++photoRequest;
+            photoArea.replaceChildren();
+            photoArea.hidden=true;
+            const raw=row?.node?.tags?.wikimedia_commons;
+            if(!raw) return;
+            const file=guidepostCommonsFile(raw);
+            if(!file){
+                const info=add(photoArea,'div','');
+                info.style.cssText='font:12px system-ui,sans-serif;opacity:.75;';
+                info.textContent='Wikimedia Commons: '+String(raw)+' (nessuna immagine singola associata)';
+                photoArea.hidden=false;
+                return;
+            }
+            const thumbnail=add(photoArea,'button','');
+            thumbnail.type='button';
+            thumbnail.setAttribute('aria-label','Ingrandisci fotografia Wikimedia Commons');
+            thumbnail.title='Clicca per vedere la fotografia a schermo intero';
+            thumbnail.style.cssText='display:inline-block;max-width:100%;padding:0;border:0;background:transparent;cursor:zoom-in;';
+            const img=document.createElement('img');
+            img.alt='Fotografia Wikimedia Commons';
+            img.loading='eager';
+            img.style.cssText='display:block;max-width:100%;max-height:180px;width:auto;height:auto;margin:0 auto;border-radius:5px;';
+            // Non inserire l'immagine nel DOM prima del caricamento: in caso di
+            // errore il browser può mostrare il nome del file come testo alternativo.
+            const loading=document.createElement('span');
+            loading.textContent='Caricamento...';
+            loading.style.cssText='display:inline-block;font:12px system-ui,sans-serif;opacity:.75;padding:12px 0;';
+            thumbnail.appendChild(loading);
+            img.onload=()=>{
+                if(request!==photoRequest || !photoArea.isConnected) return;
+                thumbnail.replaceChildren(img);
+            };
+            const fail=()=>{
+                if(request!==photoRequest || !photoArea.isConnected) return;
+                img.onload=null;
+                thumbnail.replaceChildren(document.createTextNode('Impossibile caricare la miniatura Wikimedia Commons.'));
+                thumbnail.disabled=true;
+            };
+            guidepostCommonsInfo(file).then(info=>{
+                if(request!==photoRequest || !photoArea.isConnected) return;
+                guidepostSetImageSources(img,[info?.thumbnail,
+                    guidepostCommonsImageUrl(file,400),guidepostCommonsImageUrl(file)],fail);
+            }).catch(fail);
+            thumbnail.addEventListener('click',event=>{event.stopPropagation();openGuidepostLightbox(file);});
+            photoArea.hidden=false;
+        };
+        const buttons=[];
+        const select=row=>{
+            selectedGuidepostId=String(row.id);
+            showGuidepostPhoto(row);
+            for(const entry of buttons){
+                const selected=entry.row===row;
+                entry.item.setAttribute('aria-selected',String(selected));
+                entry.item.style.background=selected?'rgba(22,131,88,.16)':'transparent';
+            }
+            orderRenderSignature=null;
+            renderOrderMapOverlay();
+            startOrderAnimation(700);
+        };
+        rows.forEach(row=>{
+            const item=add(body,'tr','');item.style.cssText='height:33px;border-bottom:1px solid #8797ac33;cursor:pointer;';
+            const cell=add(item,'td','');
+            const link=add(cell,'a',String(row.id));
+            link.href='https://www.openstreetmap.org/node/'+encodeURIComponent(row.id);
+            link.target='_blank';link.rel='noopener noreferrer';
+            link.style.cssText='color:#2367b2;text-decoration:underline;text-underline-offset:2px;white-space:nowrap;font:inherit;';
+            link.setAttribute('aria-label','Apri nodo OSM '+row.id+' in nuova scheda');
+            buttons.push({row,item});
+            item.addEventListener('click',()=>select(row));
+            const checks=[...row.checks,{key:'wikimedia_commons',value:row.node?.tags?.wikimedia_commons,optional:true,ok:Boolean(row.node?.tags?.wikimedia_commons)},{key:'ruolo',expected:'guidepost',value:row.roles.map(r=>r||'(vuoto)').join(', '),ok:row.roles.every(r=>r==='guidepost')&&row.roles.length===1}];
+            checks.forEach((check,index)=>{
+                const unknown=(index<3||check.optional)&&(row.missing||row.type!=='node');
+                const status=unknown?'non verificabile':check.optional?(check.ok?'presente: '+check.value:'facoltativo, assente'):check.ok?'conforme':`atteso ${check.expected}; attuale ${check.value??'assente'}`;
+                const symbol=unknown?'?':check.optional?(check.ok?'✓':'—'):check.ok?'✓':'⚠';
+                const cell=add(item,'td','');
+                cell.style.cssText=`text-align:center;vertical-align:middle;height:33px;padding:2px;font-size:17px;line-height:1;color:${unknown||check.optional&&!check.ok?'#8797ac':check.ok?'#16845b':'#b45c2b'};`;
+                const mark=add(cell,'span',symbol);
+                mark.style.cssText='display:inline-flex;align-items:center;justify-content:center;width:100%;height:100%;text-align:center;line-height:1;';
+                if(index===0 || index===4) cell.style.borderLeft='1px solid #8797ac55';
+                cell.title=`${check.key}: ${status}`;cell.setAttribute('aria-label',cell.title);
+            });
+        });
+        const emptyFilter=add(list,'p','');
+        emptyFilter.style.cssText='display:none;margin:12px 4px;opacity:.75;font:12px system-ui,sans-serif;';
+        applyGuidepostFilter=()=>{
+            let count=0;
+            for(const entry of buttons){
+                const visible=activeGuidepostFilter==='all' ||
+                    (activeGuidepostFilter==='valid'?entry.row.valid:!entry.row.valid);
+                entry.item.style.display=visible?'':'none';
+                if(visible) count++;
+                else if(String(selectedGuidepostId)===String(entry.row.id)){
+                    selectedGuidepostId=null;
+                    showGuidepostPhoto(null);
+                    entry.item.setAttribute('aria-selected','false');
+                    entry.item.style.background='transparent';
+                    orderRenderSignature=null;
+                    renderOrderMapOverlay();
+                }
+            }
+            emptyFilter.textContent=activeGuidepostFilter==='valid'?'Nessun nodo conforme.':'Nessun nodo da verificare.';
+            emptyFilter.style.display=count?'none':'block';
+            table.style.display=count?'':'none';
+            for(const [key,button] of filterButtons){
+                const selected=key===activeGuidepostFilter;
+                button.setAttribute('aria-pressed',String(selected));
+                button.style.textDecoration=selected?'underline':'none';
+                button.style.textUnderlineOffset='4px';
+            }
+        };
+        applyGuidepostFilter();
+        showOrderMap(pins);
+        const batch=add(output,'div','');
+        batch.style.cssText='display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin:12px 0 0;';
+        const editButton=add(batch,'button',`Aggiorna in iD editor (${edits.length} nodi)`);
+        editButton.type='button';editButton.disabled=!edits.length;
+        editButton.style.cssText='border:1px solid #16764c;border-radius:6px;padding:6px 11px;background:#168358;color:white;font:600 12px system-ui;cursor:pointer;';
+        editButton.addEventListener('click',()=>{
+            if(String(orderRelationId)!==String(relationIdFromUrl()) || !rel ||
+                !Number.isSafeInteger(rel.version)) {alert('Relazione cambiata: ripeti l’analisi.');return;}
+            if(edits.length>250){alert('Troppi nodi per un singolo intervento (massimo 250).');return;}
+            const job={relationId:String(orderRelationId),relationVersion:rel.version,nodes:edits,roles};
+            const hash='id=relation/'+encodeURIComponent(job.relationId)+
+                '&osm2cai_guideposts='+encodeURIComponent(JSON.stringify(job));
+            if(hash.length>90000){alert('Richiesta troppo grande per l’URL di iD.');return;}
+            window.open('https://www.openstreetmap.org/id#'+hash,'_blank','noopener,noreferrer');
+        });
+        // La foto segue il comando di aggiornamento, non precede il pulsante.
+        batch.after(photoArea);
+        styleGuidepostPopover();
+        // Entrambe le analisi inquadrano la geometria dell'intera relazione.
+        // Su WMT resta attivo lo zoom nativo; su OSM lo stesso zoom di Analisi geometria.
+        focusOrderGeometry(orderFull,orderRelationId,'guidepost-popover');
     }
 
     function showOrderMap(issues) {
@@ -1258,6 +1762,7 @@
     function orderGeometryGraph(ways) {
         const neighbors = new Map();
         const segments = new Set();
+        const segmentOwners = new Map();
         const ensure = id => {
             if (!neighbors.has(id)) neighbors.set(id, new Set());
         };
@@ -1269,6 +1774,8 @@
                 const a = ids[i-1], b = ids[i];
                 if (a === b) continue; // Nodo consecutivo ripetuto: nessun ramo.
                 const key = a < b ? a+'|'+b : b+'|'+a;
+                if (!segmentOwners.has(key)) segmentOwners.set(key, new Set());
+                segmentOwners.get(key).add(String(way.id));
                 if (segments.has(key)) continue;
                 segments.add(key);
                 neighbors.get(a).add(b);
@@ -1289,7 +1796,47 @@
         }
         const branchNodes = [...neighbors.keys()].filter(id => neighbors.get(id).size > 2);
         const ends = [...neighbors.keys()].filter(id => neighbors.get(id).size === 1);
-        return {neighbors, components, branchNodes, ends};
+        const overlappingSegments = [...segmentOwners.values()].filter(owners => owners.size > 1).length;
+        return {neighbors, components, branchNodes, ends, overlappingSegments};
+    }
+
+    // Per componenti lineari seleziona le coppie di estremità più vicine.
+    // L'albero minimo collega le componenti senza aggiungere coppie ridondanti:
+    // sono indizi visivi, non una ricostruzione certa del percorso mancante.
+    // Per strutture ramificate/chiuse mantiene la segnalazione generale.
+    function orderDisconnectedPairs(graph, nodes) {
+        if (graph.branchNodes.length || graph.components.length < 2) return null;
+        const ends = graph.components.map(group => group.filter(id => graph.neighbors.get(id).size === 1));
+        if (ends.some(group => group.length !== 2 || group.some(id => {
+            const n = nodes.get(id);
+            return !Number.isFinite(n?.lat) || !Number.isFinite(n?.lon);
+        }))) return null;
+        const distance = (a, b) => {
+            const na = nodes.get(a), nb = nodes.get(b), radians = Math.PI/180;
+            return Math.sin((na.lat-nb.lat)*radians/2)**2 +
+                Math.cos(na.lat*radians)*Math.cos(nb.lat*radians)*Math.sin((na.lon-nb.lon)*radians/2)**2;
+        };
+        const visited = new Set([0]), best = new Map(), pairs = [];
+        let current = 0;
+        while (visited.size < ends.length) {
+            for (let i=0; i<ends.length; i++) {
+                if (visited.has(i)) continue;
+                for (const a of ends[current]) for (const b of ends[i]) {
+                    const score = distance(a,b);
+                    if (!best.has(i) || score < best.get(i).score)
+                        best.set(i,{a,b,from:current,to:i,score});
+                }
+            }
+            let nearest = null;
+            for (const pair of best.values())
+                if (!nearest || pair.score < nearest.score) nearest = pair;
+            if (!nearest) return null;
+            pairs.push(nearest);
+            current = nearest.to;
+            visited.add(current);
+            best.delete(current);
+        }
+        return pairs;
     }
 
     function orderProblemPoints(full, relationId) {
@@ -1314,11 +1861,22 @@
             issues.push({lat:node.lat,lon:node.lon,nodeId,type,label,detail});
         };
         if (graph.components.length > 1) {
-            graph.components.forEach((group,i)=>{
-                const ends=group.filter(n=>graph.neighbors.get(n).size===1);
-                // Per una componente chiusa si indica un nodo rappresentativo.
-                (ends.length ? ends : group.slice(0,1)).forEach(n=>add(n,'disconnected',String(i+1),'Componente '+(i+1)));
-            });
+            const pairs = orderDisconnectedPairs(graph,nodes);
+            if (pairs) {
+                const marked = new Set();
+                for (const pair of pairs) for (const [id,component] of [[pair.a,pair.from],[pair.b,pair.to]]) {
+                    if (marked.has(id)) continue;
+                    marked.add(id);
+                    add(id,'disconnected',String(component+1),'Componente '+(component+1)+
+                        ' · estremità vicina a un altro tratto: possibile discontinuità da verificare');
+                }
+            } else {
+                graph.components.forEach((group,i)=>{
+                    const ends=group.filter(n=>graph.neighbors.get(n).size===1);
+                    // Componenti ramificate/chiuse: non dedurre un punto di distacco.
+                    (ends.length ? ends : group.slice(0,1)).forEach(n=>add(n,'disconnected',String(i+1),'Componente '+(i+1)));
+                });
+            }
         }
         for (const n of graph.branchNodes)
             add(n,'branch','!','Biforcazione ('+graph.neighbors.get(n).size+' rami distinti)');
@@ -1471,6 +2029,7 @@
         const topology = !connected ? 'disconnected' : branches ? 'branching'
             : ring ? 'ring' : linear ? 'linear' : 'complex';
         const repeated = edges.length - new Set(edges.map(e => e.id)).size;
+        const overlaps = graph.overlappingSegments;
         // Il riordino delle way rimane basato sulle loro ESTREMITÀ: il grafo
         // completo serve per l'analisi, non per spezzare/modificare le way.
         const adjacency = new Map();
@@ -1484,23 +2043,22 @@
         const nestedRelations = geometry.nested;
         const roleSensitive = edges.some(e => e.role.trim() !== '');
 
-        // Verifica se esiste un verso globale continuo nell'ordine ATTUALE.
-        // Il solo confronto tra coppie consecutive genera falsi positivi.
-        function traverseCurrent(start) {
-            let cursor = start, breaks = 0;
-            for (const e of edges) {
-                if (e.a === cursor) cursor = e.b;
-                else if (e.b === cursor) cursor = e.a;
-                else { breaks++; cursor = e.b; }
-            }
-            return breaks;
+        // Minimo numero di interruzioni nell'ordine ATTUALE, considerando
+        // entrambi i versi di ogni way anche dopo una discontinuità.
+        // Ogni stato conserva il costo minimo per una delle due estremità
+        // di arrivo: evita scelte locali che gonfiano il conteggio.
+        let states = [{end:edges[0].a, breaks:0}, {end:edges[0].b, breaks:0}];
+        for (let i=1; i<edges.length; i++) {
+            const e = edges[i];
+            const cost = start => Math.min(...states.map(s => s.breaks + (s.end === start ? 0 : 1)));
+            states = [{end:e.b, breaks:cost(e.a)}, {end:e.a, breaks:cost(e.b)}];
         }
-        const breaks = Math.min(traverseCurrent(edges[0].a), traverseCurrent(edges[0].b));
+        const breaks = Math.min(...states.map(s => s.breaks));
         const continuous = breaks === 0;
 
         // Riordino suggerito solo per catene/anelli semplici, con membri way
         // unici e ruoli vuoti. Le altre topologie richiedono verifica manuale.
-        const safe = !repeated && !roleSensitive && !nestedRelations && (linear || ring);
+        const safe = !repeated && !overlaps && !roleSensitive && !nestedRelations && (linear || ring);
         let proposal = null;
         if (safe) {
             const first = edges[0];
@@ -1530,7 +2088,7 @@
             }
         }
         const changes = proposal ? proposal.filter((e,i) => e.index !== i).length : 0;
-        return {total:edges.length, breaks, continuous, repeated, branches, connected,
+        return {total:edges.length, breaks, continuous, repeated, overlaps, branches, connected, components:graph.components.length,
             ends:ends.length, ring, topology, roleSensitive, nestedRelations,
             proposal, changes, nonWays};
     }
@@ -1579,11 +2137,11 @@
         const result = checkMemberOrder(full, relationId);
         if (result.error) { setMemberOrderIndicator(result.incomplete ? 'gray' : 'error'); return; }
         if (result.nestedRelations) {
-            const valid = result.continuous && !result.repeated && !result.branches && result.connected;
+            const valid = result.continuous && !result.repeated && !result.overlaps && !result.branches && result.connected;
             setMemberOrderIndicator(valid ? 'ok' : 'error');
             return;
         }
-        const hasProblems = result.breaks > 0 || result.repeated > 0 ||
+        const hasProblems = result.breaks > 0 || result.repeated > 0 || result.overlaps > 0 ||
             result.branches > 0 || !result.connected || !result.proposal;
         setMemberOrderIndicator(hasProblems ? 'error' : 'ok');
     }
@@ -1609,14 +2167,17 @@
             branching:'Percorso con diramazioni',disconnected:'Componenti scollegate',
             complex:'Topologia complessa'};
         line('Topologia: '+(typeLabels[result.topology] || 'Non determinata')+'.',true);
+        line('Geometria: '+(result.connected ? 'connessa (1 componente)' : result.components+' componenti scollegate')+'.',true);
         line('Way: '+result.total+' · continuità sequenza attuale: '+
-            (result.continuous ? 'sì' : 'no')+' · interruzioni rilevate: '+result.breaks+'.',true);
+            (result.continuous ? 'sì' : 'no')+' · passaggi non continui nella sequenza: '+result.breaks+'.',true);
+        if (result.breaks) line('Il conteggio della sequenza può includere way fuori ordine: non indica il numero di distacchi geometrici.');
         if (result.nonWays) line('Altri membri (node/relation): '+result.nonWays+'; esclusi dalla proposta.');
         if (result.repeated) line('Way ripetute: '+result.repeated);
+        if (result.overlaps) line('Segmenti condivisi da way distinte: '+result.overlaps+'. Riordino automatico disabilitato.');
         if (result.branches) line('Biforcazioni: '+result.branches);
         if (result.roleSensitive) line('Sono presenti ruoli delle way: riordino automatico sospeso per non alterarne la semantica.');
         if (result.nestedRelations) line('Sottorelazioni: '+result.nestedRelations+'. Way incluse nell’analisi geometrica; riordino automatico disabilitato.');
-        if (!result.connected) line('Sono presenti componenti scollegate.');
+        if (!result.connected && !result.branches) line('Per componenti lineari, i pin indicano le estremità più vicine da verificare, non collegamenti certi da creare. Per componenti chiuse sono mostrati punti rappresentativi.');
         const issues=orderProblemPoints(orderFull,orderRelationId);
         // L'inquadratura della geometria non dipende dalla presenza di anomalie:
         // deve funzionare anche per percorsi regolari, su OSM e su WMT.
@@ -1624,7 +2185,7 @@
         if (issues.length) showOrderMap(issues);
         renderOrderMapControls(output,issues);
         if (!result.proposal) {
-            if (result.nestedRelations && result.continuous && !result.branches && result.connected) {
+            if (result.nestedRelations && result.continuous && !result.repeated && !result.overlaps && !result.branches && result.connected) {
                 showOrderArrows(orderFull, relationGeometryMembers(orderFull,orderRelationId).members
                     .map(m=>({id:String(m.ref)})));
             }
@@ -1679,11 +2240,8 @@
                     feedback.textContent = 'L’inversione non modifica la sequenza.';
                     return;
                 }
-                if (!window.confirm('Invertire l’ordine delle '+ways.length+
-                    ' way della relazione '+orderRelationId+' in iD? Sarà richiesta conferma anche in iD. '+
-                    'Non verrà salvata automaticamente alcuna modifica su OSM.')) return;
                 const job = {relationId:String(orderRelationId),version:rel.version,before,after};
-                openOrderInID(job, feedback, 'iD aperto: conferma lì l’inversione, poi controlla e salva manualmente.');
+                openOrderInID(job, feedback, 'iD aperto: controlla l’inversione e salva manualmente.');
             });
             actions.appendChild(force);
             output.append(actions, feedback);
@@ -1781,20 +2339,18 @@
             const after=rel.members.map(m=>norm(m.type==='way'?orderedWays[index++]:m));
             const job={relationId:String(orderRelationId),version:rel.version,
                 before:rel.members.map(norm),after};
-            if (!window.confirm('Aprire iD con '+labelMap[selectedDirection].toLowerCase()+' ('+firstLast(targetSequence)+') per la relazione '+orderRelationId+
-                '? In iD sarà richiesta un’ulteriore conferma. Non verrà eseguito alcun salvataggio OSM.')) return;
             // Apriamo direttamente l'editor iD, perché /edit inoltra a /id
             // soltanto un insieme limitato di parametri e scarterebbe il job.
-            openOrderInID(job, feedback, 'iD aperto in una nuova scheda: conferma lì il riordino.');
+            openOrderInID(job, feedback, 'iD aperto in una nuova scheda: verifica e salva manualmente il riordino.');
         });
         actions.append(prepare); output.append(actions,feedback);
-        line('Il riordino viene applicato soltanto nella sessione di iD dopo conferma; verifica e salva manualmente su OpenStreetMap.');
+        line('Il riordino viene applicato nella sessione di iD; verifica e salva manualmente su OpenStreetMap.');
     }
 
     const CSS = `
       #osm2cai-bar, #osm2cai-bar * { box-sizing:border-box !important; }
       #osm2cai-bar { position:fixed !important; top:60px !important; left:355px !important;
-        width:934px !important; max-width:calc(100vw - 365px) !important;
+        width:754px !important; max-width:calc(100vw - 16px) !important;
         z-index:2147483000 !important; font:13px/1.35 system-ui,sans-serif !important;
         color:#233344 !important; pointer-events:none !important; }
       #osm2cai-bar .oc-card { margin-left:34px; width:calc(100% - 34px); height:98px; pointer-events:auto; background:#fff; border:1px solid #d8dfe7;
@@ -1835,11 +2391,19 @@
       #osm2cai-bar .oc-closed { display:flex; align-items:center; justify-content:center; width:34px; height:98px; border-radius:7px 0 0 7px; border:1px solid #d8dee6; background:white; box-shadow:0 2px 9px #0002; pointer-events:auto; cursor:pointer; font-size:21px; color:#356293; }
       #osm2cai-bar .oc-close-rail { position:absolute; top:0; left:0; width:34px; height:100%; display:flex; align-items:center; justify-content:center; background:white; border:1px solid #d8dee6; border-right:0; border-radius:7px 0 0 7px; pointer-events:auto; }
       #osm2cai-bar .oc-help-wrap {display:flex; align-items:center; justify-content:center; width:32px; height:100%; flex:0 0 32px;}
-      #osm2cai-bar .oc-member-row { display:flex; align-items:center; justify-content:space-between; height:38px; padding:0 12px; gap:10px; background:rgba(52,120,237,.04); }
+      #osm2cai-bar .oc-member-row { display:flex; align-items:center; justify-content:flex-start; height:38px; padding:0 8px; gap:8px; background:rgba(52,120,237,.04); }
       #osm2cai-bar .oc-member-button { display:inline-flex; align-items:center; justify-content:center; gap:8px; height:30px; padding:0 16px; border:1px solid #1650b0; border-radius:6px; background:linear-gradient(#3478ed,#1451aa); color:#fff; box-shadow:0 1px 3px #0002; font-size:13px; font-weight:700; cursor:pointer; white-space:nowrap; }
+      /* Misure identiche su OSM e WMT, indipendenti dalle etichette dei link. */
+      #osm2cai-bar .oc-member-row > #osm2cai-order-button { flex:0 0 170px; width:170px; min-width:170px; padding:0 8px; }
+      #osm2cai-bar .oc-member-row > #osm2cai-guidepost-button { flex:0 0 220px; width:220px; min-width:220px; padding:0 7px; }
+      #osm2cai-bar .oc-member-row > .oc-actions { margin-left:auto; gap:6px; min-width:0; }
+      #osm2cai-bar .oc-actions > a.oc-action:nth-of-type(1) { flex:0 0 88px; width:88px; min-width:88px; padding:0 5px; }
+      #osm2cai-bar .oc-actions > a.oc-action:nth-of-type(2) { flex:0 0 137px; width:137px; min-width:137px; padding:0 5px; }
+      #osm2cai-bar .oc-actions .oc-help-wrap { flex:0 0 30px; width:30px; }
       #osm2cai-bar .oc-member-icon { display:inline-flex; align-items:center; justify-content:center; color:#356293; }
       #osm2cai-bar .oc-member-icon svg { width:18px; height:18px; }
       #osm2cai-bar .oc-member-dot { display:inline-block; flex:0 0 10px; width:10px; height:10px; border-radius:50%; background:#9ca3af; }
+      #osm2cai-guidepost-dot { display:block !important; visibility:visible !important; opacity:1 !important; flex:0 0 12px !important; width:12px !important; height:12px !important; min-width:12px !important; overflow:visible !important; }
       #osm2cai-bar .oc-popover { position:absolute; left:34px; top:100%; margin-top:5px; width:calc(100% - 34px); max-width:calc(100vw - 24px); max-height:70vh; overflow:auto; background:white; border:1px solid #cbd5e1; border-radius:6px; box-shadow:0 3px 12px #0003; pointer-events:auto; }
       #osm2cai-bar .oc-order-popover { position:absolute; left:34px; top:100%; margin-top:5px; width:450px; max-width:calc(100vw - 24px); max-height:70vh; overflow:auto; background:white; border:1px solid #cbd5e1; border-radius:8px; box-shadow:0 3px 12px #0003; pointer-events:auto; }
       #osm2cai-bar .oc-order-popover-content { padding:14px 16px; }
@@ -2035,22 +2599,47 @@
             'background':'white','color':'#356293',
             'font':'700 16px/1 system-ui,sans-serif','cursor':'pointer'
         });
+        // Identiche misure anche quando la CSP di OSM blocca il foglio CSS.
+        all('.oc-card, .oc-main, .oc-metrics, .oc-metric, .oc-member-row, .oc-member-button, .oc-actions, .oc-action, .oc-help-wrap', {
+            'box-sizing':'border-box'
+        });
         set(root.querySelector('.oc-member-row'), {
             'display':'flex','align-items':'center','justify-content':'flex-start',
-            'height':MEMBER_ROW_HEIGHT+'px','padding':'0 12px','gap':'10px',
+            'height':MEMBER_ROW_HEIGHT+'px','padding':'0 8px','gap':'8px',
             'background':'rgba(52,120,237,0.04)'
         });
-        set(root.querySelector('.oc-member-button'), {
+        all('.oc-member-button', {
             'display':'inline-flex','align-items':'center','justify-content':'center','gap':'8px',
-            'height':'30px','padding':'0 16px','border':'1px solid #1650b0','border-radius':'6px',
+            'height':'30px','padding':'0 8px','border':'1px solid #1650b0','border-radius':'6px',
             'background':'linear-gradient(#3478ed,#1451aa)', 'box-shadow':'0 1px 3px #0002',
             'color':'white','font':'700 13px/1 system-ui,sans-serif','white-space':'nowrap','cursor':'pointer'
         });
+        set($('order-button'), {'flex':'0 0 170px','width':'170px','min-width':'170px',
+            'max-width':'170px','padding':'0 8px','margin':'0'});
+        set($('guidepost-button'), {'flex':'0 0 220px','width':'220px','min-width':'220px',
+            'max-width':'220px','padding':'0 7px','margin':'0',
+            'background':'linear-gradient(#36836b,#225a48)'});
+        set(root.querySelector('.oc-actions'), {'gap':'6px','margin-left':'auto'});
+        const actionLinks = root.querySelectorAll('.oc-actions > a.oc-action');
+        [88, 137].forEach((width, index) => {
+            set(actionLinks[index], {'flex':'0 0 '+width+'px','width':width+'px',
+                'min-width':width+'px','max-width':width+'px',
+                'padding':'0 5px','margin':'0'});
+        });
+        set(root.querySelector('.oc-help-wrap'), {'flex':'0 0 30px','width':'30px',
+            'min-width':'30px','max-width':'30px'});
+
         set(root.querySelector('.oc-member-icon'), {
             'display':'inline-flex','align-items':'center','justify-content':'center','color':'#356293'
         });
         all('.oc-member-icon svg', {'width':'18px','height':'18px'});
-        set(root.querySelector('.oc-member-dot'), {'display':'inline-block','flex':'0 0 10px','width':'10px','height':'10px','border-radius':'50%'});
+        // Il fallback su OSM deve includere ENTRAMBI i pallini, non soltanto
+        // il primo (.querySelector selezionava solo Analisi geometria).
+        all('.oc-member-dot', {'display':'inline-block','visibility':'visible','opacity':'1',
+            'flex':'0 0 10px','flex-shrink':'0','width':'10px','height':'10px',
+            'min-width':'10px','min-height':'10px','border-radius':'50%'});
+        set($('guidepost-dot'), {'display':'block','visibility':'visible','opacity':'1',
+            'flex':'0 0 12px','width':'12px','height':'12px','min-width':'12px','overflow':'visible'});
         // Linguetta di chiusura: sul bordo sinistro, nello stesso punto di apertura.
         set(root.querySelector('.oc-close-rail'), {
             'position':'absolute','top':'0','left':'0','right':'auto',
@@ -2084,11 +2673,22 @@
             'box-shadow':'0 3px 12px rgba(0,0,0,.2)','pointer-events':'auto',
             'z-index':'3',
             'display':root.querySelector('.oc-popover')?.hidden ? 'none' : 'block'});
-        set(root.querySelector('.oc-order-popover'), {'position':'absolute','left':RAIL_WIDTH+'px','top':'100%',
-            'margin-top':'5px','width':'450px','max-width':'calc(100vw - 24px)','max-height':'70vh',
-            'height':'auto','overflow':'auto','background':'white','border':'1px solid #cbd5e1',
-            'border-radius':'8px','box-shadow':'0 3px 12px rgba(0,0,0,.2)','pointer-events':'auto',
-            'z-index':'2','display':root.querySelector('.oc-order-popover')?.hidden ? 'none' : 'block'});
+        // OSM può bloccare il foglio <style> dello userscript. Entrambi i popup
+        // condividono .oc-order-popover: occorre applicare il fallback a CIASCUNO,
+        // non solo al primo (quello geometrico), altrimenti la segnaletica perde
+        // position/left/top e viene resa come un blocco largo dentro la barra.
+        root.querySelectorAll('.oc-order-popover').forEach(popup => {
+            const isGuidepost=popup.id==='osm2cai-guidepost-popover';
+            set(popup, {'box-sizing':'border-box','position':'absolute',
+                'left':RAIL_WIDTH+'px','top':'100%','right':'auto','bottom':'auto',
+                'margin':'5px 0 0','padding':'0','width':'450px',
+                'max-width':'calc(100vw - 24px)','max-height':'70vh',
+                'height':'auto','overflow':'auto','background':'white','border':'1px solid #cbd5e1',
+                'border-radius':isGuidepost?'12px':'8px',
+                'box-shadow':'0 3px 12px rgba(0,0,0,.2)',
+                'pointer-events':'auto','z-index':isGuidepost?'3':'2',
+                'display':popup.hidden?'none':'block'});
+        });
         // Lo stile iniettato può essere bloccato dalla CSP di OSM: il popup
         // percorribilità deve ricevere gli stessi stili inline degli altri popup.
         const issuesPopup = root.querySelector('.oc-issues-popover');
@@ -2231,7 +2831,143 @@
         style('.oc-popover .oc-help-more', {'color':palette.muted});
         styleHelpPopup(palette, dark);
         applyModifiedPopupTheme();
+        styleGuidepostPopover();
         // I pallini API/percorribilità/allineamento restano semanticamente colorati.
+    }
+
+    // Layout indipendente dal sito (WMT / OSM) e dal tema del sito:
+    // OSM può bloccare il foglio <style> via CSP e applicare regole globali
+    // ai div, alle tabelle e ai pulsanti. Perciò le regole essenziali sono
+    // impostate con !important sui singoli elementi, inclusi quelli creati
+    // dinamicamente da renderGuidepostAnalysis().
+    function styleGuidepostPopover() {
+        const popup = $('guidepost-popover');
+        if (!popup) return;
+        // Lo stesso tema della barra OSM2CAI, anche su OSM in modalità scura.
+        // Mantiene invariati dimensioni, filtri e disposizione della tabella.
+        const dark = darkThemeEnabled();
+        const surface = dark ? '#26282b' : '#ffffff';
+        const foreground = dark ? '#e4e8ed' : '#233344';
+        const heading = dark ? '#e4e8ed' : '#334155';
+        const subtleBorder = dark ? '#565e68' : '#cbd5e1';
+        const headerGroup = dark ? '#354740' : '#cde8dd';
+        const headerDetail = dark ? '#303b39' : '#eff3f3';
+        const linkColor = dark ? '#a8c7ff' : '#2367b2';
+        const put = (node, rules) => {
+            if (!node) return;
+            for (const [key, value] of Object.entries(rules))
+                node.style.setProperty(key, value, 'important');
+        };
+        const each = (selector, rules) => popup.querySelectorAll(selector).forEach(el => put(el, rules));
+        put(popup, {
+            'box-sizing':'border-box', 'position':'absolute',
+            'left':RAIL_WIDTH+'px', 'top':'100%', 'right':'auto', 'bottom':'auto',
+            'width':'450px', 'max-width':'calc(100vw - 24px)',
+            'height':'auto', 'max-height':'70vh', 'margin':'5px 0 0', 'padding':'0',
+            'overflow-x':'hidden', 'overflow-y':'auto',
+            'background':surface, 'color':foreground, 'color-scheme':dark ? 'dark' : 'light',
+            'border':'1px solid '+subtleBorder, 'border-radius':'12px',
+            'box-shadow':'0 3px 12px rgba(0,0,0,.2)',
+            'font':'13px/1.4 system-ui,-apple-system,Segoe UI,sans-serif',
+            'text-align':'left', 'pointer-events':'auto', 'z-index':'3',
+            'display':popup.hidden ? 'none' : 'block'
+        });
+        put(popup.firstElementChild, {
+            'box-sizing':'border-box', 'display':'block',
+            'width':'100%', 'margin':'0', 'padding':'14px 16px',
+            'background':'transparent', 'color':foreground,
+            'font':'13px/1.4 system-ui,-apple-system,Segoe UI,sans-serif'
+        });
+        const output=$('guidepost-results');
+        put(output, {'display':'block', 'width':'100%', 'margin':'0', 'padding':'0',
+            'background':'transparent', 'color':foreground});
+        if (!output) return;
+        // Contatori / filtri: nessun reset o larghezza forzata dai CSS di OSM.
+        const summary=output.firstElementChild;
+        if (summary && summary.querySelectorAll('button[aria-pressed]').length===3) {
+            put(summary, {'display':'flex','align-items':'center','gap':'7px',
+                'flex-wrap':'wrap','margin':'8px 0 12px','padding':'0','background':'transparent'});
+            summary.querySelectorAll('button').forEach(button => put(button, {
+                'appearance':'none','-webkit-appearance':'none','display':'inline-block',
+                'width':'auto','min-width':'0','max-width':'none','height':'auto',
+                'margin':'0','padding':'2px 1px','border':'0','border-radius':'3px',
+                'background':'transparent', 'box-shadow':'none',
+                'font':'600 12px/1.4 system-ui,sans-serif','cursor':'pointer'
+            }));
+            const filterButtons=summary.querySelectorAll('button[aria-pressed]');
+            // Totale segue il tema; gli altri due contatori conservano colori semantici leggibili.
+            if(filterButtons[0]) put(filterButtons[0], {'color':foreground});
+            if(filterButtons[1]) put(filterButtons[1], {'color':dark ? '#65d6a4' : '#16845b'});
+            if(filterButtons[2]) put(filterButtons[2], {'color':dark ? '#f4a776' : '#b45c2b'});
+        }
+        const list=popup.querySelector('.oc-guidepost-table')?.parentElement;
+        put(list, {'box-sizing':'border-box','width':'100%', 'max-height':'min(240px,34vh)',
+            'overflow-y':'auto','overflow-x':'hidden','position':'relative',
+            'margin':'0','padding':'0','background':'transparent'});
+        const table=popup.querySelector('.oc-guidepost-table');
+        put(table, {'box-sizing':'border-box','display':'table','width':'100%',
+            'min-width':'0','max-width':'100%','margin':'0','padding':'0',
+            'border':'0','border-collapse':'separate','border-spacing':'0',
+            'table-layout':'fixed','background':'transparent',
+            'font':'12px/1.25 system-ui,sans-serif','color':foreground});
+        each('.oc-guidepost-table thead', {'display':'table-header-group'});
+        each('.oc-guidepost-table tbody', {'display':'table-row-group'});
+        each('.oc-guidepost-table tr', {'display':'table-row','height':'33px',
+            'border':'0','margin':'0','padding':'0'});
+        popup.querySelectorAll('.oc-guidepost-table thead th').forEach(th => {
+            const secondLevel=th.parentElement.rowIndex===1;
+            const grouped=th.colSpan===4;
+            const role=th.rowSpan===2 && th!==popup.querySelector('.oc-guidepost-table thead th:first-child');
+            put(th, {
+                'box-sizing':'border-box','display':'table-cell','position':'sticky',
+                'top':secondLevel?'24px':'0','z-index':secondLevel?'4':'3',
+                'height':th.rowSpan===2?'58px':secondLevel?'34px':'24px',
+                'margin':'0','padding':'2px 1px',
+                'border':'0','border-bottom':'1px solid '+subtleBorder,
+                'border-left':(grouped||role)?'1px solid '+subtleBorder:'0',
+                'background':grouped?headerGroup:headerDetail,'color':heading,
+                'font':`600 ${th.textContent==='wikimediacommons'?'10':'12'}px/1.25 system-ui,sans-serif`,
+                'text-align':'center','vertical-align':'middle',
+                'overflow-wrap':'normal','white-space':'normal'
+            });
+        });
+        each('.oc-guidepost-table tbody td', {
+            'box-sizing':'border-box','display':'table-cell',
+            'height':'33px','margin':'0','padding':'2px',
+            'border':'0','background':'transparent','color':foreground,
+            'text-align':'center','vertical-align':'middle','white-space':'normal'
+        });
+        each('.oc-guidepost-table tbody td:not(:first-child) > span', {
+            'display':'inline-flex','align-items':'center','justify-content':'center',
+            'box-sizing':'border-box','width':'100%','height':'100%',
+            'margin':'0','padding':'0','text-align':'center','line-height':'1'
+        });
+        each('.oc-guidepost-table tbody td:nth-child(2),.oc-guidepost-table tbody td:last-child', {
+            'border-left':'1px solid '+subtleBorder
+        });
+        each('.oc-guidepost-table tbody td:first-child', {
+            'text-align':'left','font-size':'12px'
+        });
+        each('.oc-guidepost-table tbody a', {
+            'color':linkColor,'text-decoration':'underline',
+            'text-underline-offset':'2px','white-space':'nowrap',
+            'font':'12px/1.25 system-ui,sans-serif'
+        });
+        const editButton=[...output.querySelectorAll('button')].find(b => b.textContent?.startsWith('Aggiorna in iD editor'));
+        put(editButton, {
+            'appearance':'none','-webkit-appearance':'none',
+            'display':'inline-block','width':'auto','min-width':'0','max-width':'100%',
+            'height':'auto','margin':'0','padding':'6px 11px',
+            'border':'1px solid #16764c','border-radius':'6px',
+            'background':'#168358','color':'#ffffff','box-shadow':'none',
+            'font':'600 12px/1.4 system-ui,sans-serif','text-align':'center',
+            'cursor':editButton?.disabled?'default':'pointer'
+        });
+        put(popup.querySelector('.oc-guidepost-photo'), {
+            'box-sizing':'border-box','width':'100%',
+            'margin':'10px 0 2px','padding':'0',
+            'background':'transparent','color':foreground,'text-align':'center'
+        });
     }
 
     // Aspetto del popup applicato elemento per elemento: OSM può bloccare
@@ -2420,10 +3156,11 @@
 
             </div>
             <div class="oc-member-row">
-              <button type="button" class="oc-member-button" id="osm2cai-order-button" aria-label="Analisi relazione" aria-controls="osm2cai-order-popover" aria-expanded="false">
+              <button type="button" class="oc-member-button" id="osm2cai-order-button" aria-label="Analisi geometria" aria-controls="osm2cai-order-popover" aria-expanded="false">
                 <span class="oc-member-dot" id="osm2cai-order-dot" aria-hidden="true"></span>
-                <span>Analisi relazione</span>
+                <span>Analisi geometria</span>
               </button>
+              <button type="button" class="oc-member-button" id="osm2cai-guidepost-button" aria-controls="osm2cai-guidepost-popover" aria-expanded="false"><svg id="osm2cai-guidepost-dot" aria-hidden="true" width="12" height="12" viewBox="0 0 12 12" style="display:block!important;visibility:visible!important;opacity:1!important;width:12px!important;height:12px!important;min-width:12px!important;flex:0 0 12px!important;overflow:visible!important"><circle id="osm2cai-guidepost-dot-circle" cx="6" cy="6" r="5" fill="#94a3b8" stroke="none"></circle></svg><span>Analisi segnaletica verticale</span></button>
               <div class="oc-actions">
                 <a class="oc-action" id="osm2cai-target" aria-disabled="true" target="_blank" rel="noopener noreferrer" aria-label="Apri su OSM2CAI" title="Apri su OSM2CAI"><span class="oc-action-icon">${ICON_LINK}</span><span>OSM2CAI</span></a>
                 ${isWmt()
@@ -2479,18 +3216,18 @@
                   <tr><td>Percorribilità</td><td>Stato del percorso e dettagli disponibili.</td></tr>
                   <tr><td>Data validazione</td><td>Età dell'ultima validazione OSM2CAI.</td></tr>
                   <tr><td>Allineamento</td><td>Confronto tra le date OSM e OSM2CAI.</td></tr>
-                  <tr><td>Analisi relazione</td><td>Controllo della continuità e possibili problemi.</td></tr>
+                  <tr><td>Analisi geometria</td><td>Controllo della continuità e possibili problemi.</td></tr>
                 </tbody>
               </table>
-              <div class="oc-help-more" style="font-size:12px;margin-top:10px;">Per la spiegazione dettagliata dei controlli consulta <a href="https://github.com/andrea-del-sarto/OSM2CAI_Tools/blob/main/FUNZIONALIT%C3%80.md" target="_blank" rel="noopener noreferrer">Funzionalità ↗</a>.</div>
             </div></div>
-          <div class="oc-order-popover" id="osm2cai-order-popover" role="dialog" aria-label="Analisi relazione" hidden>
+          <div class="oc-order-popover" id="osm2cai-order-popover" role="dialog" aria-label="Analisi geometria" hidden>
             <div class="oc-order-popover-content">
-              <div class="oc-order-header">
-                <div class="oc-order-title">Analisi relazione</div>
-                <button type="button" class="oc-order-close" id="osm2cai-order-close" aria-label="Chiudi verifica membri">×</button>
-              </div>
               <div id="osm2cai-order-results" aria-live="polite" style="margin:0;"></div>
+            </div>
+          </div>
+          <div class="oc-order-popover" id="osm2cai-guidepost-popover" role="dialog" aria-label="Analisi segnaletica verticale" hidden style="width:450px;max-width:calc(100vw - 24px);z-index:3;border-radius:12px;">
+            <div style="padding:14px 16px;">
+              <div id="osm2cai-guidepost-results" aria-live="polite"></div>
             </div>
           </div>
           <div id="osm2cai-issues-popover" class="oc-issues-popover" role="dialog" aria-label="Dettagli stato di percorribilità" hidden>
@@ -2510,7 +3247,7 @@
         // questi due collegamenti sulla pagina OSM/WMT. Per il normale clic
         // sinistro usiamo il gestore userscript, che apre una vera scheda.
         // Ctrl/Cmd/Shift/Alt+clic, clic centrale e menu contestuale conservano
-        // il comportamento nativo dei link; nessun intervento su Analisi relazione.
+        // il comportamento nativo dei link; nessun intervento su Analisi geometria.
         const isFirefoxBrowser = /Firefox\//.test(navigator.userAgent);
         bar.querySelectorAll('.oc-actions a.oc-action').forEach(link => {
             link.style.setProperty('pointer-events','auto','important');
@@ -2554,6 +3291,142 @@
         const orderButton = $('order-button');
         const orderPopover = $('order-popover');
         const orderClose = $('order-close');
+        const guidepostPopover=$('guidepost-popover');
+        guidepostPopover?.addEventListener('click',event=>{
+            if(event.target.closest('.oc-guidepost-table,.oc-guidepost-photo')) return;
+            if(selectedGuidepostId===null) return;
+            selectedGuidepostId=null;
+            const photo=guidepostPopover.querySelector('.oc-guidepost-photo');
+            if(photo){photo.replaceChildren();photo.hidden=true;}
+            for(const row of guidepostPopover.querySelectorAll('.oc-guidepost-table tbody tr')){
+                row.setAttribute('aria-selected','false');
+                row.style.background='transparent';
+            }
+            orderRenderSignature=null;
+            renderOrderMapOverlay();
+            startOrderAnimation(700);
+        });
+        $('guidepost-button')?.addEventListener('click',()=>{
+            const opening=guidepostPopover.hidden;
+            closeGuidepostPopover();
+            if (opening) {
+                closeIssuesPopover();
+                orderPopover.hidden=true;orderButton.setAttribute('aria-expanded','false');
+                popover.hidden=true;button.setAttribute('aria-expanded','false');
+                clearOrderMap();
+                guidepostPopover.hidden=false;
+                $('guidepost-button').setAttribute('aria-expanded','true');
+                renderGuidepostAnalysis();
+            }
+            applyInlineLayout();
+        });
+        // WMT: il profilo e' considerato gestito solo quando risulta aperto.
+        // Non effettuare mai un secondo click automatico dopo un click non
+        // verificato: un toggle tardivo potrebbe richiudere il profilo.
+        let wmtElevationHandledRelation = null;
+        let wmtElevationAttempt = null;
+        let wmtElevationUncertainClickRelation = null;
+        function revealWmtElevationProfile() {
+            if (!isWmt()) return;
+            const rid=relationIdFromUrl();
+            if (!rid || wmtElevationHandledRelation === rid ||
+                (wmtElevationAttempt && wmtElevationAttempt.rid===rid && wmtElevationAttempt.pending)) return;
+            const attempt={rid,pending:true,clicked:false,tries:0,verificationTries:0};
+            wmtElevationAttempt=attempt;
+            const current=()=>wmtElevationAttempt===attempt && rid===relationIdFromUrl();
+            const finish=success=>{
+                if (!current()) return;
+                attempt.pending=false;
+                if (success) wmtElevationHandledRelation=rid;
+            };
+            const locate=()=>{
+                const panels=[...document.querySelectorAll('.sidepanel')].filter(p=>{
+                    const r=p.getBoundingClientRect(), st=getComputedStyle(p);
+                    return r.width>140 && r.height>120 && st.display!=='none' && st.visibility!=='hidden';
+                });
+                for(const panel of panels){
+                    const walker=document.createTreeWalker(panel,NodeFilter.SHOW_TEXT);
+                    let t;
+                    while((t=walker.nextNode())){
+                        const raw=(t.textContent||'').replace(/[\s▸▾▶▼►▴▵⌄⌃]+/g,' ').trim();
+                        if(!/^(profilo altimetrico|elevation profile|height profile|höhenprofil|profil altimétrique)$/i.test(raw)) continue;
+                        const el=t.parentElement;
+                        if(!el || el.closest('#osm2cai-bar')) continue;
+                        const details=el.closest('details');
+                        if(details) return {panel,trigger:details.querySelector('summary')||el,details};
+                        let trigger=el.closest('summary,button,[role="button"],[aria-expanded]');
+                        if(!trigger){
+                            for(let p=el,i=0;p&&p!==panel&&i<5;p=p.parentElement,i++){
+                                const cls=String(p.className||'');
+                                if(/header|heading|accordion|collapse|toggle|section-title|panel-title/i.test(cls) ||
+                                    getComputedStyle(p).cursor==='pointer') {trigger=p;break;}
+                            }
+                        }
+                        return {panel,trigger:trigger||el,details:null};
+                    }
+                }
+                return null;
+            };
+            const state=found=>{
+                if(found.details) return found.details.open?'open':'closed';
+                const {trigger}=found;
+                const expanded=trigger.getAttribute('aria-expanded');
+                if(expanded==='true') return 'open';
+                if(expanded==='false') return 'closed';
+                if(trigger.classList.contains('expanded')||trigger.classList.contains('active')) return 'open';
+                const label=(trigger.textContent||'').trim();
+                // Gli indicatori native WMT sono utili anche se manca aria-expanded.
+                if(/^[\s▼▾⌄]/.test(label) && /^[▼▾⌄]/.test(label.trim())) return 'open';
+                if(/^[▸▶►▴]/.test(label.trim())) return 'closed';
+                const section=trigger.parentElement;
+                const chart=section?.querySelector('svg,canvas,.chart,.profile-chart');
+                if(chart && chart.getBoundingClientRect().height>35 &&
+                    getComputedStyle(chart).visibility!=='hidden') return 'open';
+                return 'unknown';
+            };
+            const scrollIntoSidebar=found=>{
+                const scroller=found.trigger.closest('.sidepanel-content')||found.panel;
+                const h=found.trigger.getBoundingClientRect(),b=scroller.getBoundingClientRect();
+                if(h.top<b.top||h.bottom>b.bottom) scroller.scrollTop+=h.top-b.top-8;
+            };
+            const verify=()=>{
+                if(!current() || !attempt.pending) return;
+                const found=locate();
+                if(found && state(found)==='open') {wmtElevationUncertainClickRelation=null;finish(true);return;}
+                if(++attempt.verificationTries<20) setTimeout(verify,200);
+                else finish(false);
+            };
+            const reveal=()=>{
+                if(!current() || !attempt.pending || $('order-popover')?.hidden) {
+                    if(current()) finish(false);
+                    return;
+                }
+                const found=locate();
+                if(!found){
+                    if(++attempt.tries<30) setTimeout(reveal,300);
+                    else finish(false);
+                    return;
+                }
+                const before=state(found);
+                if(before==='open'){wmtElevationUncertainClickRelation=null;finish(true);scrollIntoSidebar(found);return;}
+                // In caso di stato sconosciuto, un solo click per apertura
+                // del popup; i successivi tentativi sono permessi solo se
+                // il controllo indica esplicitamente che il profilo e' chiuso.
+                if(before==='unknown' && wmtElevationUncertainClickRelation===rid) {
+                    finish(false);return;
+                }
+                if(found.details){
+                    found.details.open=true;
+                }else{
+                    attempt.clicked=true;
+                    found.trigger.click();
+                    if(before==='unknown') wmtElevationUncertainClickRelation=rid;
+                }
+                scrollIntoSidebar(found);
+                verify();
+            };
+            reveal();
+        }
         orderButton?.addEventListener('click', () => {
             if (!orderPopover) {
                 return;
@@ -2562,10 +3435,12 @@
             orderPopover.hidden = !opening;
             orderButton.setAttribute('aria-expanded', String(opening));
             if (opening) {
+                closeGuidepostPopover();
                 closeIssuesPopover();
                 popover.hidden = true;
                 button?.setAttribute('aria-expanded', 'false');
                 renderOrderCheck();
+                revealWmtElevationProfile();
             }
             applyInlineLayout();
         });
@@ -2585,6 +3460,7 @@
             applyInlineLayout();
         });
         button?.addEventListener('click', () => {
+            closeGuidepostPopover();
             popover.hidden = !popover.hidden;
             button.setAttribute('aria-expanded', String(!popover.hidden));
             if (!popover.hidden) closeIssuesPopover();
@@ -2597,6 +3473,7 @@
         const issuesTrigger = $('issues-trigger');
         const issuesPanel = $('issues-popover');
         const showIssues = () => {
+            closeGuidepostPopover();
             clearTimeout(issuesHoverTimer);
             issuesHoverTimer = null;
             if (!issuesPanel || !issuesTrigger) return;
@@ -2642,6 +3519,8 @@
                 document.removeEventListener('pointerdown', onOutsidePopup);
                 return;
             }
+            if (guidepostPopover.contains(event.target) || $('guidepost-button')?.contains(event.target) || event.target.closest?.('#osm2cai-order-overlay')) return;
+            closeGuidepostPopover();
             if (popover.hidden && (!orderPopover || orderPopover.hidden) && (!issuesPanel || issuesPanel.hidden)) {
                 return;
             }
@@ -2667,6 +3546,7 @@
         document.addEventListener('keydown', function onEscape(e) {
             if (!bar.isConnected) { document.removeEventListener('keydown', onEscape); return; }
             if (e.key === 'Escape') {
+                if (!guidepostPopover.hidden) {closeGuidepostPopover();$('guidepost-button')?.focus();}
                 closeIssuesPopover();
                 const orderPopover = $('order-popover');
                 let changed = false;
@@ -2693,6 +3573,7 @@
     // Incrementare sequence rende inoffensive anche eventuali risposte tardive.
     function cancelRequests() {
         ++sequence;
+        if (relationLoad?.state === 'pending') relationLoad.state = 'cancelled';
         for (const request of [...inFlight]) {
             request.abort();
         }
@@ -2711,6 +3592,7 @@
         collapsed = value;
         localStorage.setItem(COLLAPSED_KEY, value ? '1' : '0');
         if (value) {
+            closeGuidepostPopover();
             resetModifiedElements();
             closeIssuesPopover();
             cancelRequests();
@@ -2763,6 +3645,7 @@
         clearTimeout(modifiedHoverTimer);
         hideModifiedPopup();
         resetModifiedElements();
+        relationLoad = null;
         document.getElementById('osm2cai-bar')?.remove();
     }
 
@@ -3144,19 +4027,54 @@
             !elements.some(item => item.type === 'relation' && String(item.id) === String(relationId))) {
             return null;
         }
+        // Una risposta parziale non deve produrre un falso "aggiornato".
+        // Verifica tutti i riferimenti raggiungibili, inclusi nodi e sottorelazioni.
+        const byKey = new Map(elements.map(item => [item.type+':'+item.id, item]));
+        const pending = ['relation:'+relationId], visited = new Set();
+        while (pending.length) {
+            const key = pending.pop();
+            if (visited.has(key)) continue;
+            visited.add(key);
+            const item = byKey.get(key);
+            if (!item) return null;
+            if (item.type === 'relation') {
+                if (!Array.isArray(item.members)) return null;
+                for (const member of item.members) {
+                    if (!['relation', 'way', 'node'].includes(member.type)) return null;
+                    pending.push(member.type+':'+member.ref);
+                }
+            } else if (item.type === 'way') {
+                if (!Array.isArray(item.nodes) || item.nodes.length < 2) return null;
+                for (const id of item.nodes) pending.push('node:'+id);
+            }
+        }
         let mostRecent = -Infinity;
         for (const item of elements) {
-            const stamp = typeof item.timestamp === 'string' ? Date.parse(item.timestamp) : NaN;
+            const stamp = parseApiDate(item.timestamp);
             if (!Number.isFinite(stamp)) { return null; }
             mostRecent = Math.max(mostRecent, stamp);
         }
         return new Date(mostRecent).toISOString();
     }
 
+    // Date.parse normalizza alcune date impossibili (es. 30 febbraio).
+    // Controlla il giorno di calendario prima di accettare il timestamp.
+    function parseApiDate(value) {
+        if (typeof value !== 'string') return NaN;
+        const stamp = value.trim();
+        const match = stamp.match(/^(\d{4})-(\d{2})-(\d{2})(?:$|[T\s])/);
+        if (!match) return NaN;
+        const year = Number(match[1]), month = Number(match[2]), day = Number(match[3]);
+        const date = new Date(0);
+        date.setUTCFullYear(year, month - 1, day);
+        if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return NaN;
+        return Date.parse(stamp);
+    }
+
     // Età della validazione in mesi di calendario, usando la data locale odierna.
     // Le date future e quelle malformate non sono classificabili.
     function validationDateKind(value) {
-        if (typeof value !== 'string') { return 'gray'; }
+        if (!Number.isFinite(parseApiDate(value))) { return 'gray'; }
         const match = value.trim().match(/^(\d{4})-(\d{2})-(\d{2})(?:$|[T\s])/);
         if (!match) { return 'gray'; }
         const year = Number(match[1]);
@@ -3220,14 +4138,13 @@
         const sda = String(p.sda ?? '').trim();
         let kind = 'gray';
         let message = 'non verificabile';
-        const osmMs = typeof osmDate === 'string' ? Date.parse(osmDate) : NaN;
+        const osmMs = parseApiDate(osmDate);
         const source = sda === '4' ? p.validation_date :
             ['1', '2', '3'].includes(sda) ? p.updated_at : null;
         if (Number.isFinite(osmMs) && typeof osmDate === 'string' &&
             /^\d{4}-\d{2}-\d{2}T/.test(osmDate) && typeof source === 'string') {
             const stamp = source.trim();
-            const validFormat = /^\d{4}-\d{2}-\d{2}(?:$|T|\s)/.test(stamp);
-            const sourceMs = validFormat ? Date.parse(stamp) : NaN;
+            const sourceMs = parseApiDate(stamp);
             if (Number.isFinite(sourceMs)) {
                 // Le date senza orario vengono confrontate a livello di giorno.
                 const aligned = /^\d{4}-\d{2}-\d{2}$/.test(stamp)
@@ -3311,7 +4228,7 @@
         return {...full,elements:[...byKey.values()]};
     }
 
-    async function load(relationId, recreate = true) {
+    async function load(relationId, recreate = true, verifiedFull = null) {
         if (isOsmEditing()) {
             cancelRequests();
             removePanel();
@@ -3325,13 +4242,16 @@
         orderFull = null;
         orderRelationId = null;
         const orderOutput = $('order-results');
+        closeGuidepostPopover();
         if (orderOutput) orderOutput.textContent = '';
         const ticket = ++sequence;
+        const currentLoad = {id:relationId, ticket, state:'pending'};
+        relationLoad = currentLoad;
         const isCurrent = () => !collapsed && !isOsmEditing() &&
             ticket === sequence && relationId === relationIdFromUrl();
 
         // Avvio simultaneo: nessuna delle due API deve bloccare l'altra.
-        const osmRequest = getJson('https://api.openstreetmap.org/api/0.6/relation/' + relationId + '/full.json');
+        const osmRequest = verifiedFull ? Promise.resolve(verifiedFull) : getJson('https://api.openstreetmap.org/api/0.6/relation/' + relationId + '/full.json');
         const caiRequest = getJson(API + '/' + relationId);
         let full = null;
         let data = null;
@@ -3341,6 +4261,7 @@
 
         function finishAlignment() {
             if (!isCurrent() || unsupportedRoute || !osmFinished || !caiFinished) { return; }
+            currentLoad.state = 'complete';
             if (data) {
                 fillAlignment(data, latestRelationWayTimestamp(full, relationId));
                 const p = data?.properties || {};
@@ -3376,6 +4297,16 @@
         osmRequest.then(async result => {
             if (!isCurrent()) { return; }
             full = result;
+            // Escludi i percorsi non supportati prima di scaricarne i figli.
+            // Solo route=hiking è ammesso, anche nelle super-relazioni.
+            const osmRelation = full?.elements?.find(item =>
+                item.type === 'relation' && String(item.id) === String(relationId));
+            if (osmRelation?.tags?.route !== 'hiking') {
+                unsupportedRoute = true;
+                cancelRequests();
+                removePanel();
+                return;
+            }
             if (full) {
                 // Segnala temporaneamente l'analisi in corso mentre si scaricano
                 // le geometrie delle sottorelazioni eventualmente assenti.
@@ -3385,15 +4316,13 @@
                 orderFull = full; orderRelationId = relationId;
             }
             updateMemberOrderIndicator(full, relationId);
+            updateGuidepostIndicator(full, relationId);
             osmFinished = true;
-            const osmRelation = full?.elements?.find(item =>
-                item.type === 'relation' && String(item.id) === String(relationId));
-            if (osmRelation?.tags?.route && osmRelation.tags.route !== 'hiking') {
-                unsupportedRoute = true;
-                cancelRequests();
-                removePanel();
-                return;
-            }
+            // Se l'utente ha aperto l'analisi durante la richiesta, sostituisci
+            // il messaggio di attesa senza obbligarlo a riaprire il popup.
+            const orderPopover = $('order-popover');
+            if (orderPopover && !orderPopover.hidden) renderOrderCheck();
+            if ($('guidepost-popover') && !$('guidepost-popover').hidden) renderGuidepostAnalysis();
             finishAlignment();
             const linkBounds = boundsFromGeojson(data?.geometry || data?.features?.[0]?.geometry)
                 || boundsFromOsmFull(full, relationId);
@@ -3422,25 +4351,32 @@
                 removePanel();
                 return;
             }
-            if (!force && relationIdShown === id && document.getElementById('osm2cai-bar')) {
+            const reusableLoad = relationLoad?.id === id &&
+                (relationLoad.state === 'complete' ||
+                 (relationLoad.state === 'pending' && relationLoad.ticket === sequence));
+            if (!force && relationIdShown === id && document.getElementById('osm2cai-bar') &&
+                (collapsed || reusableLoad)) {
                 adjustPosition();
                 return;
             }
             cancelRequests();
             relationIdShown = id;
-            // Quando è chiusa, non alterare il DOM durante la navigazione OSM.
-            // Registra solo il nuovo ID; i dati verranno richiesti all'apertura.
-            if (collapsed) {
-                if (!document.getElementById('osm2cai-bar')) {
+            // Nessuna barra (nemmeno compressa) prima della verifica OSM.
+            removePanel();
+            const checkTicket = sequence;
+            getJson('https://api.openstreetmap.org/api/0.6/relation/' + id + '/full.json')
+                .then(full => {
+                    if (checkTicket !== sequence || id !== relationIdFromUrl() || isOsmEditing()) return;
+                    const relation = full?.elements?.find(item =>
+                        item.type === 'relation' && String(item.id) === String(id));
+                    // In caso di errore API, tag assente o altra route: resta nascosta.
+                    if (relation?.tags?.route !== 'hiking') return;
                     newPanel(id);
-                }
-                return;
-            }
-            if (!document.getElementById('osm2cai-bar')) {
-                newPanel(id);
-            }
-            resetPanelForRelation(id);
-            load(id, false);
+                    if (!collapsed) {
+                        resetPanelForRelation(id);
+                        load(id, false, full);
+                    }
+                });
         }, 100);
     }
 
@@ -3451,19 +4387,26 @@
         initialized = true;
         insertStyle();
         refresh();
-        window.addEventListener('pagehide', () => {
+        let reloadAfterPageRestore = false;
+        const suspend = () => {
+            // beforeunload può precedere pagehide: conserva il fatto che
+            // almeno una richiesta è stata interrotta da uno dei due eventi.
+            reloadAfterPageRestore = reloadAfterPageRestore || inFlight.size > 0;
             clearOrderMap();
             clearTimeout(refreshTimer);
             clearTimeout(positionTimer);
             clearTimeout(modifiedHoverTimer);
             cancelRequests();
-        });
-        window.addEventListener('beforeunload', () => {
-            clearOrderMap();
-            clearTimeout(refreshTimer);
-            clearTimeout(positionTimer);
-            clearTimeout(modifiedHoverTimer);
-            cancelRequests();
+        };
+        window.addEventListener('pagehide', suspend);
+        window.addEventListener('beforeunload', suspend);
+        window.addEventListener('pageshow', event => {
+            if (!event.persisted) return;
+            const reload = reloadAfterPageRestore;
+            reloadAfterPageRestore = false;
+            // refresh rispetta la barra chiusa e non interroga API in editor.
+            // I dati completi non richiedono un nuovo download dello stesso ID.
+            refresh(reload);
         });
         window.addEventListener('hashchange', () => refresh());
         window.addEventListener('popstate', () => refresh());

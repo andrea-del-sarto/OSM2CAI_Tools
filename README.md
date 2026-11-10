@@ -1,6 +1,6 @@
 # OSM2CAI Tools
 
-**OSM2CAI Tools** è uno _userscript_ dedicato ai mappatori e ai validatori di OpenStreetMap (OSM) focalizzati sulla **Rete Escursionistica Italiana (REI)**. Il suo obiettivo primario è semplificare la verifica dei percorsi escursionistici e facilitare l'integrazione dei dati con **OSM2CAI**, la piattaforma del Club Alpino Italiano (CAI).
+**OSM2CAI Tools** è uno _userscript_ dedicato ai mappatori di OpenStreetMap (OSM) focalizzati sulla **Rete Escursionistica Italiana (REI)**. Il suo obiettivo primario è semplificare la verifica dei percorsi escursionistici e facilitare l'integrazione dei dati con **OSM2CAI**, la piattaforma del Club Alpino Italiano (CAI).
 
 ![Barra principale di OSM2CAI Tools](screenshot/OSM2CAI_tools-barra%20principale.png)
 
@@ -14,9 +14,13 @@ Il progetto nasce come collegamento tra OSM e OSM2CAI. Oggi affianca alla consul
 
 ## Funzionalità
 
-- **Consultazione OSM2CAI:** dati API, SDA, percorribilità, validazione e allineamento con OSM.
-- **Analisi dei percorsi:** continuità, biforcazioni, anelli, relazioni annidate e indicatori sulla mappa.
-- **Riordino con iD:** propone un ordine dei membri `way` quando non ambiguo, senza salvataggio automatico.
+- **Consultazione OSM2CAI:** dati API relativi a SDA, percorribilità, validazione e allineamento con OSM.
+- **Analisi geometria:** verifica della continuità del percorso, biforcazioni, anelli, relazioni annidate e anomalie, con indicatori sulla mappa.
+- **Riordino in iD editor:** proposta di riordino dei membri `way` quando la geometria non è ambigua, con verifica e salvataggio manuale.
+- **Analisi segnaletica verticale:** verifica dei guidepost presenti nella relazione, controllando tag OSM, ruoli e conformità, con pin numerati e filtri interattivi.
+- **Aggiornamento dei nodi in iD editor:** correzione massiva dei tag mancanti e dei ruoli vuoti dei guidepost, con verifica e salvataggio manuale.
+- **Fotografie Wikimedia Commons:** visualizzazione delle miniature associate ai guidepost, ingrandibili a schermo intero.
+- **Integrazione Waymarked Trails:** analisi delle relazioni e apertura automatica del profilo altimetrico.
 
 Per legenda, dettagli di ogni campo, popup, comportamento dell’analisi e limiti noti, consulta la **[guida alle funzionalità](FUNZIONALIT%C3%80.md)**.
 
