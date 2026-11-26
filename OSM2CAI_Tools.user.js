@@ -1,9 +1,7 @@
 // ==UserScript==
 // @name         OSM2CAI Tools
 // @namespace    https://osm2cai.cai.it/
-// @version      0.13.0
-// @updateURL    https://raw.githubusercontent.com/andrea-del-sarto/OSM2CAI_Tools/main/OSM2CAI_Tools.user.js
-// @downloadURL  https://raw.githubusercontent.com/andrea-del-sarto/OSM2CAI_Tools/main/OSM2CAI_Tools.user.js
+// @version      0.14.0
 // @homepageURL   https://github.com/andrea-del-sarto/OSM2CAI_Tools
 // @description  Strumenti per consultare OSM2CAI, verificare i percorsi escursionistici e riordinare le relazioni OSM.
 // @author       andrea-del-sarto
@@ -13,12 +11,15 @@
 // @match        https://hiking.waymarkedtrails.org/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_info
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @grant        GM_openInTab
 // @grant        unsafeWindow
 // @connect      osm2cai.cai.it
 // @connect      api.openstreetmap.org
 // @connect      commons.wikimedia.org
 // @connect      upload.wikimedia.org
+// @connect      raw.githubusercontent.com
 // @run-at       document-start
 // ==/UserScript==
 
@@ -33,7 +34,175 @@
     'use strict';
 
     // La versione visualizzata nel popup proviene dai metadati Tampermonkey.
-    const SCRIPT_VERSION = GM_info?.script?.version || '0.13.0';
+    const SCRIPT_VERSION = GM_info?.script?.version || '0.14.0';
+    const CHANGELOG_URL = 'https://github.com/andrea-del-sarto/OSM2CAI_Tools/blob/main/CHANGELOG.md';
+    const CHANGELOG_SEEN_KEY = 'osm2cai-changelog-seen-github-version';
+    let changelogShownThisPage = false;
+
+    const CHANGELOG_RAW_URL = 'https://raw.githubusercontent.com/andrea-del-sarto/OSM2CAI_Tools/main/CHANGELOG.md';
+
+    // Legge SOLO la prima sezione versionata del changelog GitHub.
+    // Le versioni successive alla prima intestazione ## x.y.z vengono escluse.
+    function parseLatestChangelog(markdown) {
+        const lines = markdown.replace(/\r\n?/g, '\n').split('\n');
+        const versionPattern = /^##\s+(\d+\.\d+\.\d+)(?:\s|$)/;
+        const start = lines.findIndex(line => versionPattern.test(line));
+        if (start < 0) throw Error('Nessuna versione trovata in CHANGELOG.md');
+        const version = lines[start].match(versionPattern)[1];
+        let end = start + 1;
+        while (end < lines.length && !versionPattern.test(lines[end])) end++;
+        return {version, lines: lines.slice(start + 1, end)};
+    }
+
+    // Per non fidarsi dell'HTML proveniente da un file remoto, crea solo nodi DOM
+    // e inserisce il testo con textContent (mai innerHTML per il changelog).
+    function renderLatestChangelog(target, parsed, dark) {
+        const heading = document.createElement('div');
+        heading.style.cssText = 'font-weight:700;font-size:14px;margin-bottom:10px;';
+        heading.textContent = 'Versione ' + parsed.version;
+        target.appendChild(heading);
+        let list = null;
+        let entries = 0;
+        const addFormattedText = (parent, source) => {
+            // Supporta soltanto il grassetto Markdown senza interpretare HTML remoto.
+            const fragments = source.split(/(\*\*[^*]+\*\*)/g);
+            for (const part of fragments) {
+                if (part.startsWith('**') && part.endsWith('**')) {
+                    const strong = document.createElement('strong');
+                    strong.textContent = part.slice(2, -2);
+                    parent.appendChild(strong);
+                } else parent.appendChild(document.createTextNode(part));
+            }
+        };
+        for (const raw of parsed.lines) {
+            const line = raw.trim();
+            const section = line.match(/^###\s+(.+)$/);
+            const item = line.match(/^[-*]\s+(.+)$/);
+            if (section) {
+                list = null;
+                const title = document.createElement('strong');
+                title.style.cssText = 'display:block;margin:12px 0 5px;';
+                title.textContent = section[1];
+                target.appendChild(title);
+            } else if (item) {
+                if (!list) {
+                    list = document.createElement('ul');
+                    list.style.cssText = 'margin:0 0 8px;padding-left:20px;';
+                    target.appendChild(list);
+                }
+                const li = document.createElement('li');
+                li.style.cssText = 'margin:0 0 5px;';
+                addFormattedText(li,item[1]);
+                list.appendChild(li);
+                entries++;
+            } else if (line) {
+                list = null;
+                const paragraph = document.createElement('p');
+                paragraph.style.cssText = 'margin:6px 0;';
+                addFormattedText(paragraph,line);
+                target.appendChild(paragraph);
+                entries++;
+            }
+        }
+        if (!entries) throw Error('La sezione ' + parsed.version + ' è vuota');
+    }
+
+    // Recupera il changelog prima di aprire il popup. L'intestazione della
+    // prima versione pubblicata deve coincidere con la versione installata.
+    // Se GitHub non risponde o le versioni differiscono, non mostra nulla
+    // e non registra il changelog come letto.
+    function showVersionChangelogOnce() {
+        if (changelogShownThisPage || isOsmEditing() || !document.body) return;
+        try {
+            if (GM_getValue(CHANGELOG_SEEN_KEY, '') === SCRIPT_VERSION) return;
+        } catch (error) {
+            console.warn('[OSM2CAI Tools] Lettura preferenza changelog non riuscita:', error);
+            return;
+        }
+        if (document.getElementById('osm2cai-version-changelog')) return;
+        changelogShownThisPage = true;
+        try {
+            GM_xmlhttpRequest({
+                method: 'GET', url: CHANGELOG_RAW_URL, timeout: 12000,
+                headers: {'Accept': 'text/plain'},
+                onload: response => {
+                    try {
+                        if (response.status !== 200) throw Error('HTTP ' + response.status);
+                        if (typeof response.responseText !== 'string' || response.responseText.length > 150000)
+                            throw Error('Changelog non valido o troppo grande');
+                        const parsed = parseLatestChangelog(response.responseText);
+                        if (parsed.version !== SCRIPT_VERSION) {
+                            console.info('[OSM2CAI Tools] Popup novità non mostrato: script ' +
+                                SCRIPT_VERSION + ', ultimo changelog ' + parsed.version);
+                            return;
+                        }
+                        // Una navigazione SPA può aver eliminato la barra mentre
+                        // GitHub rispondeva: non creare un popup fuori contesto.
+                        if (!document.getElementById('osm2cai-bar') || isOsmEditing()) return;
+                        displayVerifiedChangelog(parsed);
+                    } catch (error) {
+                        console.warn('[OSM2CAI Tools] Lettura changelog non riuscita:', error);
+                    }
+                },
+                onerror: () => console.warn('[OSM2CAI Tools] Changelog GitHub non raggiungibile'),
+                ontimeout: () => console.warn('[OSM2CAI Tools] Timeout changelog GitHub')
+            });
+        } catch (error) {
+            console.warn('[OSM2CAI Tools] Richiesta changelog non riuscita:', error);
+        }
+    }
+
+    function displayVerifiedChangelog(parsed) {
+        if (document.getElementById('osm2cai-version-changelog')) return;
+        const dark = darkThemeEnabled();
+        // Valida il contenuto prima di montare qualunque finestra.
+        const fragment = document.createDocumentFragment();
+        renderLatestChangelog(fragment, parsed, dark);
+        const overlay = document.createElement('div');
+        overlay.id = 'osm2cai-version-changelog';
+        overlay.setAttribute('data-turbo-temporary', '');
+        overlay.style.cssText = 'position:fixed!important;inset:0!important;z-index:2147483646!important;'+
+            'display:flex!important;align-items:center!important;justify-content:center!important;'+
+            'padding:16px!important;background:rgba(12,20,31,.55)!important;box-sizing:border-box!important;';
+        const dialog = document.createElement('section');
+        dialog.setAttribute('role','dialog');
+        dialog.setAttribute('aria-modal','true');
+        dialog.setAttribute('aria-labelledby','osm2cai-changelog-title');
+        dialog.style.cssText = 'box-sizing:border-box!important;max-width:480px!important;width:100%!important;'+
+            'max-height:min(620px,90vh)!important;overflow:auto!important;border-radius:12px!important;'+
+            'padding:20px 22px!important;border:1px solid '+(dark?'#526071':'#d8e1eb')+'!important;'+
+            'background:'+(dark?'#282b30':'#fff')+'!important;color:'+(dark?'#e8edf4':'#27384b')+'!important;'+
+            'box-shadow:0 16px 48px #0006!important;font:13px/1.55 system-ui,-apple-system,sans-serif!important;';
+        // Solo il layout statico usa innerHTML; dati remoti aggiunti con textContent.
+        dialog.innerHTML = `
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:5px;">
+            <strong id="osm2cai-changelog-title" style="font-size:19px;">Novità OSM2CAI Tools</strong>
+            <span style="white-space:nowrap;font-size:12px;opacity:.8;">v${SCRIPT_VERSION}</span>
+          </div>
+          <div style="opacity:.8;margin-bottom:12px;">Ultime modifiche pubblicate su GitHub</div>
+          <div id="osm2cai-changelog-body" aria-live="polite" style="border-top:1px solid ${dark?'#526071':'#d8e1eb'};padding-top:12px;margin-bottom:14px;">Novità della versione</div>
+          <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
+            <a href="${CHANGELOG_URL}" target="_blank" rel="noopener noreferrer" style="color:${dark?'#9dc4ff':'#2563b6'};text-decoration:underline;">Changelog completo ↗</a>
+            <button type="button" id="osm2cai-changelog-dismiss" style="cursor:pointer;border:0;border-radius:7px;background:#2865bd;color:#fff;font:600 13px system-ui,sans-serif;padding:9px 16px;">Ho capito</button>
+          </div>`;
+        overlay.appendChild(dialog);
+        document.body.appendChild(overlay);
+        const body = dialog.querySelector('#osm2cai-changelog-body');
+        const dismiss = () => {
+            try { GM_setValue(CHANGELOG_SEEN_KEY, SCRIPT_VERSION); }
+            catch (error) { console.warn('[OSM2CAI Tools] Salvataggio preferenza changelog non riuscito:', error); }
+            overlay.remove();
+            document.removeEventListener('keydown', onEscape, true);
+        };
+        const onEscape = event => {
+            if (event.key === 'Escape') { event.stopPropagation(); dismiss(); }
+        };
+        dialog.querySelector('#osm2cai-changelog-dismiss')?.addEventListener('click', dismiss);
+        document.addEventListener('keydown', onEscape, true);
+        dialog.querySelector('#osm2cai-changelog-dismiss')?.focus();
+        // Il contenuto remoto viene convertito in nodi di testo sicuri.
+        body.replaceChildren(fragment);
+    }
 
     // Accetta esclusivamente una permutazione degli slot way: nessuna aggiunta,
     // rimozione, modifica di ruolo o movimento dei membri node/relation.
@@ -180,6 +349,7 @@
         const raw=location.hash.match(/(?:^|[&#])osm2cai_guideposts=([^&]+)/)?.[1];
         if (!raw) return;
         let job;
+        const extraVersions=new Map();
         try {
             if (raw.length>90000) throw Error('Richiesta troppo grande');
             job=JSON.parse(decodeURIComponent(raw));
@@ -187,10 +357,14 @@
                 !Number.isSafeInteger(Number(job.relationId)) ||
                 !Number.isSafeInteger(job.relationVersion) || job.relationVersion<1 ||
                 !Array.isArray(job.nodes) || job.nodes.length<1 || job.nodes.length>250 ||
-                !Array.isArray(job.roles) || job.roles.length>250) throw Error('Richiesta non valida');
+                !Array.isArray(job.roles) || job.roles.length>250 ||
+                !Array.isArray(job.extraRoles||[]) || (job.extraRoles||[]).length>250) throw Error('Richiesta non valida');
+            const validId = id => typeof id === 'string' && /^[1-9]\d{0,15}$/.test(id) &&
+                Number.isSafeInteger(Number(id)) && String(Number(id)) === id;
+            if (!validId(job.relationId)) throw Error('ID relazione non canonico');
             const ids=new Set();
             for (const node of job.nodes) {
-                if (!/^[1-9]\d{0,15}$/.test(String(node.id)) ||
+                if (!validId(node.id) ||
                     !Number.isSafeInteger(Number(node.id)) || ids.has(String(node.id)) ||
                     !Number.isSafeInteger(node.version) || node.version<1 ||
                     !node.add || typeof node.add!=='object' || Array.isArray(node.add) ||
@@ -201,15 +375,31 @@
             }
             const members=new Set();
             for (const role of job.roles) {
-                if (!/^[1-9]\d{0,15}$/.test(String(role.id)) ||
+                if (!validId(role.id) ||
                     !Number.isSafeInteger(Number(role.id)) || !ids.has(String(role.id)) ||
                     !Number.isSafeInteger(role.index) || role.index<0 || role.index>9999 ||
                     members.has(role.index)) throw Error('Ruoli non validi');
                 members.add(role.index);
             }
+            const extraKeys=new Set();
+            for(const role of job.extraRoles||[]){
+                if(!validId(role.relationId) || !validId(role.id) ||
+                    !Number.isSafeInteger(Number(role.relationId)) ||
+                    !Number.isSafeInteger(role.relationVersion) || role.relationVersion<1 ||
+                    !ids.has(String(role.id)) || !Number.isSafeInteger(role.index) || role.index<0 ||
+                    role.index>99999 || String(role.relationId)===String(job.relationId)) throw Error('Altre relazioni non valide');
+                const knownVersion=extraVersions.get(role.relationId);
+                if (knownVersion !== undefined && knownVersion !== role.relationVersion)
+                    throw Error('Versioni incoerenti per la stessa relazione');
+                extraVersions.set(role.relationId,role.relationVersion);
+                const k=role.relationId+':'+role.index;
+                if(extraKeys.has(k)) throw Error('Ruoli duplicati');
+                extraKeys.add(k);
+            }
         } catch(e) { alert('OSM2CAI: correzione segnaletica non valida: '+e.message); return; }
         const page=typeof unsafeWindow!=='undefined'?unsafeWindow:window;
         let captured=null,done=false,attempts=0,timer=null,requestedMissing=false;
+        let loadError=null,loadPending=false;
         const stop=()=>{done=true;if(timer!==null) clearInterval(timer);window.removeEventListener('pagehide',stop);};
         window.addEventListener('pagehide',stop,{once:true});
         const proxy=api=>{
@@ -226,49 +416,126 @@
         timer=setInterval(()=>{
             if(done) return;
             if(++attempts>240){
-                const missing=job.nodes.filter(n=>!captured?.hasEntity?.('n'+n.id)).map(n=>n.id);
-                stop();alert('OSM2CAI: impossibile preparare le modifiche. '+missing.length+' nodi non caricati da iD ('+missing.slice(0,8).join(', ')+'). Nessuna correzione applicata.');return;}
+                const missingNodes=job.nodes.filter(n=>!captured?.hasEntity?.('n'+n.id)).map(n=>n.id);
+                const missingRelations=[...new Set((job.extraRoles||[]).map(r=>r.relationId))]
+                    .filter(id=>!captured?.hasEntity?.('r'+id));
+                stop();alert('OSM2CAI: caricamento incompleto in iD. Nodi mancanti: '+
+                    missingNodes.length+'; relazioni mancanti: '+missingRelations.length+
+                    '. Nessuna correzione applicata.');return;}
             try {
                 if (!captured || typeof captured.hasEntity!=='function' || typeof captured.perform!=='function') return;
                 const relation=captured.hasEntity('r'+job.relationId);
                 if (!relation || !Array.isArray(relation.members)) return;
                 const nodes=job.nodes.map(n=>({spec:n,entity:captured.hasEntity('n'+n.id)}));
-                if(nodes.some(n=>!n.entity)) {
-                    // Le relazioni grandi possono trovarsi fuori dalla vista caricata.
-                    // Richiedi gli oggetti esplicitamente al servizio OSM di iD,
-                    // senza introdurre entità artificiose nel grafo dell'editor.
-                    if (!requestedMissing && attempts>5) {
+                const extras=[...new Set((job.extraRoles||[]).map(r=>String(r.relationId)))];
+                const missingRelations=extras.filter(id=>!captured.hasEntity('r'+id));
+                if(nodes.some(n=>!n.entity)||missingRelations.length) {
+                    if(loadError){
+                        stop();alert('OSM2CAI: impossibile caricare tutte le relazioni in iD: '+loadError+
+                            '. Nessuna correzione applicata.');return;
+                    }
+                    if(!requestedMissing && !loadPending && attempts>5){
                         requestedMissing=true;
-                        const missing=nodes.filter(n=>!n.entity).map(n=>'n'+n.spec.id);
+                        const missing=[...nodes.filter(n=>!n.entity).map(n=>'n'+n.spec.id),
+                            ...missingRelations.map(id=>'r'+id)];
                         try {
-                            const osm=captured.services?.osm || page.iD?.services?.osm;
-                            if(typeof osm?.loadMultiple==='function') osm.loadMultiple(missing,()=>{});
-                            else if(typeof captured.loadEntity==='function')
+                            const osm=captured.services?.osm||page.iD?.services?.osm;
+                            const history=typeof captured.history==='function'?captured.history():null;
+                            if(typeof osm?.loadMultiple==='function' && typeof history?.merge==='function'){
+                                loadPending=true;
+                                osm.loadMultiple(missing,(err,result)=>{
+                                    loadPending=false;
+                                    if(done)return;
+                                    if(err){loadError=err.message||String(err);return;}
+                                    const entities=Array.isArray(result?.data)?result.data:
+                                        Array.isArray(result)?result:null;
+                                    if(!entities?.length){loadError='risposta OSM senza entità';return;}
+                                    try {
+                                        // Integra le entità nel grafo di base di iD prima
+                                        // di creare la modifica nella cronologia.
+                                        history.merge(entities);
+                                        // Il caricamento termina solo quando hasEntity conferma tutte le entità.
+                                    }catch(e){loadError='integrazione nel grafo non riuscita: '+(e.message||String(e));}
+                                });
+                            }else if(typeof captured.loadEntity==='function'){
+                                loadPending=true;
+                                // loadEntity può essere asincrono: la disponibilità viene
+                                // sempre confermata da hasEntity, non dal ritorno del metodo.
                                 for(const id of missing) captured.loadEntity(id);
-                        } catch(err) { console.warn('OSM2CAI: caricamento nodi non riuscito',err); }
+                                loadPending=false;
+                            }else{
+                                loadError='il caricamento di più entità non è supportato da questa versione di iD';
+                            }
+                        }catch(err){loadError=err.message||String(err);}
                     }
                     return;
                 }
                 const bad=Number(relation.version)!==job.relationVersion ||
                     nodes.some(({spec,entity})=>Number(entity.version)!==spec.version ||
                         Object.keys(spec.add).some(k=>entity.tags?.[k]!==undefined)) ||
+                    (job.extraRoles||[]).some(({relationId,relationVersion,id,index})=>{
+                        const other=captured.hasEntity('r'+relationId);
+                        const m=other?.members?.[index];
+                        return !other || Number(other.version)!==relationVersion || !m ||
+                            m.type!=='node' || String(m.id??m.ref).replace(/^n/,'')!==String(id) || Boolean(m.role);
+                    }) ||
                     job.roles.some(({id,index})=>{
                         const member=relation.members[index];
                         return !member || member.type!=='node' ||
                             String(member.id??member.ref).replace(/^n/,'')!==String(id) || Boolean(member.role);
                     });
                 if(bad){stop();alert('OSM2CAI: dati modificati o tag/ruoli già presenti. Nessuna correzione applicata. Ripeti l’analisi.');return;}
+                // Raggruppa i ruoli di ogni relazione PRIMA della mutazione:
+                // aggiornamenti di più nodi nella stessa relazione non si annullano.
+                const roleChanges=new Map();
+                const appendRole=(relationId, spec)=>{
+                    const key='r'+relationId;
+                    if(!roleChanges.has(key)) roleChanges.set(key,[]);
+                    roleChanges.get(key).push(spec);
+                };
+                for(const spec of job.roles) appendRole(job.relationId,spec);
+                for(const spec of job.extraRoles||[]) appendRole(spec.relationId,spec);
+                // Riesegui tutti i controlli sul grafo utilizzato dalla singola
+                // azione: se non corrisponde, abortisci l'intera transazione.
+                const validateGraph=graph=>{
+                    for(const spec of job.nodes){
+                        const entity=graph.hasEntity('n'+spec.id);
+                        if(!entity || Number(entity.version)!==spec.version ||
+                            Object.keys(spec.add).some(k=>Object.prototype.hasOwnProperty.call(entity.tags||{},k)))
+                            throw Error('Nodo '+spec.id+' modificato o non caricato');
+                    }
+                    for(const [rid,changes] of roleChanges){
+                        const entity=graph.hasEntity(rid);
+                        const expectedVersion=rid==='r'+job.relationId ? job.relationVersion :
+                            extraVersions.get(rid.slice(1));
+                        if(!entity || !Array.isArray(entity.members) || Number(entity.version)!==expectedVersion)
+                            throw Error('Relazione '+rid+' modificata o non caricata');
+                        for(const spec of changes){
+                            const member=entity.members[spec.index];
+                            if(!member || member.type!=='node' ||
+                                String(member.id??member.ref).replace(/^n/,'')!==spec.id ||
+                                Boolean(member.role)) throw Error('Ruolo non aggiornabile in '+rid);
+                        }
+                    }
+                };
+                let graphCheck;
+                try {
+                    graphCheck=captured.graph?.() || captured.history?.()?.graph?.();
+                    if(graphCheck?.hasEntity) validateGraph(graphCheck);
+                } catch(e){stop();alert('OSM2CAI: '+e.message+'. Nessuna correzione applicata.');return;}
                 stop();
                 captured.perform(graph=>{
+                    validateGraph(graph);
                     let next=graph;
-                    for(const {spec} of nodes){
+                    for(const spec of job.nodes){
+                        if(!Object.keys(spec.add).length) continue;
                         const old=next.entity('n'+spec.id);
                         next=next.replace(old.update({tags:{...old.tags,...spec.add}}));
                     }
-                    if(job.roles.length){
-                        const old=next.entity('r'+job.relationId);
+                    for(const [rid,changes] of roleChanges){
+                        const old=next.entity(rid);
                         const members=old.members.map(m=>({...m}));
-                        for(const {index} of job.roles) members[index].role='guidepost';
+                        for(const spec of changes) members[spec.index].role='guidepost';
                         next=next.replace(old.update({members}));
                     }
                     return next;
@@ -388,7 +655,7 @@
 
     function renderModifiedPopup() {
         const popup = $('modified-popup');
-        if (!popup || !modifiedAfterValidation.length || $('sync')?.textContent !== 'da verificare') { return; }
+        if (!popup || !modifiedAfterValidation.length || $('sync')?.textContent !== 'non aggiornato') { return; }
         popup.replaceChildren();
         const heading = document.createElement('div');
         heading.style.cssText = 'font-weight:700;margin-bottom:7px';
@@ -1224,32 +1491,43 @@
     function guidepostCommonsFile(value) {
         if (typeof value !== 'string') return null;
         let name=value.trim();
-        if (!name || name.length>500) return null;
-        const urlMatch=name.match(/^https:\/\/commons\.wikimedia\.org\/wiki\/(File|Image):(.+)$/i);
-        if (urlMatch) {
-            try { name='File:'+decodeURIComponent(urlMatch[2]).replace(/_/g,' '); }
-            catch (_) { return null; }
+        if (!name || name.length>1000) return null;
+        // Supporta il tag OSM canonico, il link alla pagina Commons e un
+        // eventuale collegamento wiki incollato per errore nel tag.
+        const wikiMatch=name.match(/^\[\[(?:File|Image):([^|\]]+)(?:\|[^\]]*)?\]\]$/i);
+        if (wikiMatch) name='File:'+wikiMatch[1];
+        if (/^https:\/\/commons\.wikimedia\.org\//i.test(name)) {
+            try {
+                const u=new URL(name);
+                if (u.hostname!=='commons.wikimedia.org') return null;
+                const path=u.pathname.match(/^\/wiki\/(?:File|Image):(.+)$/i);
+                if (!path) return null;
+                name='File:'+decodeURIComponent(path[1]).replace(/_/g,' ');
+            } catch (_) { return null; }
         }
         if (!/^(?:File|Image):/i.test(name)) return null;
-        name=name.replace(/^(?:File|Image):/i,'').trim();
-        if (!name || /[\x00-\x1f\x7f#?]/.test(name) || name.includes('/') || name.includes('\\')) return null;
+        name=name.replace(/^(?:File|Image):/i,'').trim().replace(/_/g,' ');
+        if (!name || name.length>500 || /[\x00-\x1f\x7f#?]/.test(name) ||
+            name.includes('/') || name.includes('\\') || name.includes('|')) return null;
         return name;
     }
 
     function guidepostCommonsImageUrl(name, width) {
         // Endpoint Wikimedia per riutilizzare file: diversamente dall'URL thumbnail
         // costruito a mano, il redirect conosce il file effettivamente pubblicato.
+        // Ripristina l'endpoint della versione in cui le foto funzionavano.
         const params=new URLSearchParams({title:'Special:Redirect/file/'+name.replace(/ /g,'_')});
         if(width) params.set('width',String(width));
         return 'https://commons.wikimedia.org/w/index.php?'+params;
     }
 
+    // Cache di sessione delle URL Wikimedia, condivisa tra miniature e visualizzatore.
     const commonsImageCache=new Map();
     function guidepostCommonsInfo(name) {
         if(commonsImageCache.has(name)) return commonsImageCache.get(name);
-        // URL canonicali ricavati dalla MediaWiki Action API (imageinfo).
+        // Miniatura 240 px; l’originale è riservato esclusivamente al visualizzatore.
         const params=new URLSearchParams({action:'query',format:'json',formatversion:'2',
-            prop:'imageinfo',iiprop:'url|mime',iiurlwidth:'400',
+            prop:'imageinfo',iiprop:'url|mime',iiurlwidth:'240',
             titles:'File:'+name,origin:'*'});
         const promise=new Promise(resolve=>{
             let settled=false;
@@ -1276,6 +1554,8 @@
             } catch(_) {finish(null);}
         });
         commonsImageCache.set(name,promise);
+        // Un errore temporaneo di rete non deve restare in cache per tutta la sessione.
+        promise.then(info=>{if(!info && commonsImageCache.get(name)===promise) commonsImageCache.delete(name);});
         return promise;
     }
 
@@ -1329,6 +1609,43 @@
         });
         guidepostLightbox={overlay,onKey};
         close.focus();
+    }
+
+    // Le relazioni del nodo sono richieste all'API OSM: ref è un tag della
+    // relazione, NON il suo identificativo numerico. L'ID resta interno.
+    const guidepostRelationsCache=new Map();
+    function guidepostNodeRelations(id) {
+        const key=String(id);
+        if(guidepostRelationsCache.has(key)) return guidepostRelationsCache.get(key);
+        const request=new Promise(resolve=>{
+            let done=false;
+            const finish=value=>{if(!done){done=true;resolve(value);}};
+            try {
+                GM_xmlhttpRequest({method:'GET',url:'https://api.openstreetmap.org/api/0.6/node/'+
+                    encodeURIComponent(key)+'/relations',timeout:15000,
+                    onload:r=>{
+                        if(r.status!==200) return finish(null);
+                        try {
+                            const xml=new DOMParser().parseFromString(r.responseText,'application/xml');
+                            if(xml.querySelector('parsererror')) return finish(null);
+                            const result=[...xml.querySelectorAll('relation')].map(rel=>{
+                                const tags=Object.fromEntries([...rel.querySelectorAll(':scope > tag')].map(tag=>
+                                    [tag.getAttribute('k'),tag.getAttribute('v')]));
+                                const members=[...rel.querySelectorAll(':scope > member')].map(m=>({
+                                    type:m.getAttribute('type'),ref:m.getAttribute('ref'),role:m.getAttribute('role')||''}));
+                                return {id:rel.getAttribute('id'),version:Number(rel.getAttribute('version')),
+                                    ref:tags.ref||'',name:tags.name||'',members};
+                            }).filter(rel=>/^[1-9]\d*$/.test(rel.id)&&Number.isSafeInteger(Number(rel.id))&&
+                                Number.isSafeInteger(rel.version)&&rel.version>0);
+                            finish(result);
+                        } catch (_) {finish(null);}
+                    },onerror:()=>finish(null),ontimeout:()=>finish(null)});
+            } catch (_) {finish(null);}
+        });
+        guidepostRelationsCache.set(key,request);
+        request.then(result=>{if(!result&&guidepostRelationsCache.get(key)===request)
+            guidepostRelationsCache.delete(key);});
+        return request;
     }
 
     // Solo membri diretti: non attribuire alla radice i ruoli delle sottorelazioni.
@@ -1467,16 +1784,16 @@
             detail:`${r.node.tags?.name||r.node.tags?.ref||'Nodo '+r.id} — ${r.status==='green'?'conforme':r.status==='red'?'errore':'da completare'}`
         }));
         const list=add(output,'div','');
-        list.style.cssText='max-height:min(240px,34vh);overflow:auto;overscroll-behavior:contain;position:relative;';
+        list.style.cssText='width:552px;max-width:100%;max-height:min(240px,34vh);overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;position:relative;';
         const table=add(list,'table','');table.className='oc-guidepost-table';
-        table.style.cssText='width:100%;min-width:0;border-collapse:separate;border-spacing:0;table-layout:fixed;font:12px/1.25 system-ui,sans-serif;color:inherit;';
+        table.style.cssText='width:536px;min-width:536px;border-collapse:separate;border-spacing:0;table-layout:fixed;font:12px/1.25 system-ui,sans-serif;color:inherit;';
         // Intestazione a due livelli: ID nodo | Tag (quattro sottocolonne) | Ruolo membro.
         // Il colgroup governa le larghezze senza attribuirle alla cella Tag con colspan.
-        const widths=[23,13,18,12,18,16];
+        const widths=[104,62.4,83.2,57.2,83.2,72.8,72.8];
         const colgroup=add(table,'colgroup','');
         widths.forEach(width=>{
             const col=add(colgroup,'col','');
-            col.style.width=width+'%';
+            col.style.width=width+'px';
         });
         const thead=add(table,'thead','');
         const groupRow=add(thead,'tr','');
@@ -1487,35 +1804,41 @@
         const roleHead=add(groupRow,'th','');
         roleHead.replaceChildren(document.createTextNode('Ruolo'),document.createElement('br'),document.createTextNode('membro'));
         roleHead.scope='col';roleHead.rowSpan=2;
+        const sharedHead=add(groupRow,'th','');
+        sharedHead.replaceChildren(document.createTextNode('Numero'),document.createElement('br'),document.createTextNode('relazioni'));
+        sharedHead.scope='col';sharedHead.rowSpan=2;
         const tagsRow=add(thead,'tr','');
         ['tourism','information','hiking','wikimedia_commons'].forEach((label,index)=>{
             const cell=add(tagsRow,'th',index===3?'':label);cell.scope='col';
             if(index===3) cell.replaceChildren(document.createTextNode('wikimedia'),document.createElement('br'),document.createTextNode('commons'));
         });
-        // Intestazione fissa, con due livelli distinti durante lo scorrimento.
+        // L'intera intestazione scorre come un blocco: evita lo scalino tra
+        // celle rowspan=2 e le due righe del gruppo Tag.
+        thead.style.cssText='position:sticky;top:0;z-index:5;background:#eff3f3;';
         for(const cell of thead.querySelectorAll('th')){
             const secondLevel=cell.parentElement===tagsRow;
-            cell.style.cssText='position:sticky;z-index:3;box-sizing:border-box;padding:2px 1px;'+
+            cell.style.cssText='position:static;box-sizing:border-box;padding:2px 1px;'+
                 'background:#eff3f3;color:inherit;border-bottom:1px solid #8797ac88;'+
                 'text-align:center;vertical-align:middle;overflow-wrap:normal;'+
                 'font:600 '+(cell.textContent==='wikimediacommons'?'10':'12')+'px/1.25 system-ui,sans-serif;'+
-                'height:'+(secondLevel?'34':'24')+'px;top:'+(secondLevel?'24':'0')+'px;';
+                'height:'+(secondLevel?'34':'24')+'px;';
         }
-        for(const cell of [osmHead,roleHead]) cell.style.height='58px';
+        for(const cell of [osmHead,roleHead,sharedHead]) cell.style.height='58px';
         // Linee verticali sottili distinguono la colonna ID e il ruolo dai quattro tag.
         tagHead.style.borderLeft='1px solid #8797ac55';
         roleHead.style.borderLeft='1px solid #8797ac55';
+        sharedHead.style.borderLeft='1px solid #8797ac55';
         const body=add(table,'tbody','');
         // Anteprima esterna al contenitore con scroll: sempre sotto la tabella.
         const photoArea=add(output,'div','');
         photoArea.className='oc-guidepost-photo';
-        photoArea.hidden=true;
+        photoArea.hidden=false;photoArea.style.visibility='hidden';
         photoArea.style.cssText='margin:10px 0 2px;text-align:center;';
         let photoRequest=0;
         const showGuidepostPhoto=row=>{
             const request=++photoRequest;
             photoArea.replaceChildren();
-            photoArea.hidden=true;
+            photoArea.hidden=false;photoArea.style.visibility='hidden';
             const raw=row?.node?.tags?.wikimedia_commons;
             if(!raw) return;
             const file=guidepostCommonsFile(raw);
@@ -1523,7 +1846,7 @@
                 const info=add(photoArea,'div','');
                 info.style.cssText='font:12px system-ui,sans-serif;opacity:.75;';
                 info.textContent='Wikimedia Commons: '+String(raw)+' (nessuna immagine singola associata)';
-                photoArea.hidden=false;
+                photoArea.hidden=false;photoArea.style.visibility='visible';
                 return;
             }
             const thumbnail=add(photoArea,'button','');
@@ -1548,21 +1871,139 @@
             const fail=()=>{
                 if(request!==photoRequest || !photoArea.isConnected) return;
                 img.onload=null;
+                img.onerror=null;
                 thumbnail.replaceChildren(document.createTextNode('Impossibile caricare la miniatura Wikimedia Commons.'));
                 thumbnail.disabled=true;
             };
+            // MediaWiki API prima del caricamento: miniatura 240 px da thumburl.
+            // Solo se necessario, ripiega sul redirect Wikimedia; nessun Blob.
             guidepostCommonsInfo(file).then(info=>{
                 if(request!==photoRequest || !photoArea.isConnected) return;
                 guidepostSetImageSources(img,[info?.thumbnail,
-                    guidepostCommonsImageUrl(file,400),guidepostCommonsImageUrl(file)],fail);
-            }).catch(fail);
+                    guidepostCommonsImageUrl(file,240),guidepostCommonsImageUrl(file)],fail);
+            }).catch(()=>{
+                if(request!==photoRequest || !photoArea.isConnected) return;
+                guidepostSetImageSources(img,[guidepostCommonsImageUrl(file,240),guidepostCommonsImageUrl(file)],fail);
+            });
             thumbnail.addEventListener('click',event=>{event.stopPropagation();openGuidepostLightbox(file);});
-            photoArea.hidden=false;
+            photoArea.hidden=false;photoArea.style.visibility='visible';
         };
+        // Slot permanenti: dettagli sempre a sinistra e foto sempre a destra,
+        // anche quando un nodo non dispone di foto o di relazioni condivise.
+        // Dettagli a sinistra, fotografia a destra (circa un terzo della larghezza).
+        // L'ordine dei due elementi è soltanto visivo: logica foto/relazioni invariata.
+        const detail=add(output,'div','');
+        detail.className='oc-guidepost-details';
+        detail.style.cssText='display:none;align-items:flex-start;gap:12px;flex-wrap:nowrap;margin:10px 0 2px;width:100%;';
+        const relBox=add(detail,'div','');
+        relBox.className='oc-guidepost-relations';
+        relBox.style.cssText='flex:1 1 0;min-width:0;font:12px/1.35 system-ui,sans-serif;';
+        relBox.hidden=false;relBox.style.visibility='hidden';
+        detail.appendChild(photoArea);
+        photoArea.style.cssText='margin:0;flex:0 0 202px;width:202px;text-align:center;';
+        // Scelte inizialmente vuote: soltanto le relazioni marcate vengono
+        // incluse nella correzione del ruolo. La relazione corrente è sempre inclusa.
+        const relationSelections=new Map();
+        const relationData=new Map();
+        let relationRequest=0;
+        const renderRelations=row=>{
+            const token=++relationRequest;
+            relBox.replaceChildren();relBox.hidden=false;relBox.style.visibility='hidden';
+            if(!row) return;
+            const id=String(row.id);
+            // Mostra sempre il titolo delle relazioni: se non ce ne sono altre,
+            // indica "nessuna" senza spostare lo slot fotografico.
+            guidepostNodeRelations(id).then(relations=>{
+                if(token!==relationRequest || !relBox.isConnected) return;
+                if(!relations) return;
+                const others=relations.filter(r=>String(r.id)!==String(orderRelationId));
+                const heading=add(relBox,'div','Relazioni condivise');
+                heading.style.cssText='font-weight:700;margin:0 0 6px;';
+                relBox.hidden=false;relBox.style.visibility='visible';
+                if(!others.length){
+                    const empty=add(relBox,'div','nessuna');
+                    empty.style.cssText='font:12px/1.35 system-ui,sans-serif;';
+                    return;
+                }
+                // Primo caricamento: preseleziona soltanto le relazioni in cui
+                // tutti i membri corrispondenti hanno già ruolo guidepost.
+                // In seguito conserva le scelte manuali effettuate dall'utente.
+                let stored=relationSelections.get(id);
+                if(!stored){
+                    stored=new Set();
+                    for(const other of others){
+                        const memberships=other.members.filter(m=>m.type==='node'&&String(m.ref)===id);
+                        if(memberships.length && memberships.every(m=>m.role==='guidepost'))
+                            stored.add(String(other.id));
+                    }
+                    relationSelections.set(id,stored);
+                }
+                relationData.set(id,relations);
+                for(const relItem of others){
+                    const line=add(relBox,'label','');
+                    line.style.cssText='display:flex;align-items:center;gap:7px;padding:5px 3px;border-bottom:1px solid #8797ac44;';
+                    const box=add(line,'input','');box.type='checkbox';
+                    box.checked=stored.has(String(relItem.id));
+                    box.style.cssText='width:15px;height:15px;margin:0;accent-color:#168358;';
+                    box.addEventListener('click',ev=>ev.stopPropagation());
+                    box.addEventListener('change',()=>{
+                        if(box.checked) stored.add(String(relItem.id));
+                        else stored.delete(String(relItem.id));
+                        refreshEditButton();
+                    });
+                    const caption=add(line,'span',relItem.ref?'ref '+relItem.ref:'ref assente');
+                    caption.title=relItem.ref?'ref: '+relItem.ref:'Relazione OSM senza tag ref';
+                    caption.style.cssText='font-weight:600;flex:1;';
+                    // Il ruolo e' specifico per ogni relazione, non per il nodo.
+                    // Avvisa anche quando il ruolo e' valorizzato ma non conforme.
+                    const nodeMemberships=relItem.members.filter(m=>m.type==='node'&&String(m.ref)===id);
+                    const missingRole=nodeMemberships.some(m=>m.role==='');
+                    const wrongRoles=[...new Set(nodeMemberships.filter(m=>m.role!==''&&m.role!=='guidepost').map(m=>m.role))];
+                    const guidepostPresent=nodeMemberships.length>0 &&
+                        nodeMemberships.every(m=>m.role==='guidepost');
+                    if(guidepostPresent){
+                        const note=add(line,'small','guidepost presente');
+                        note.style.cssText='color:#168358;font:600 11px/1.2 system-ui,sans-serif;white-space:nowrap;';
+                    }
+                    if(missingRole || wrongRoles.length){
+                        const warning=add(line,'span','⚠');
+                        const message=missingRole?'Ruolo guidepost mancante':
+                            'Ruolo non guidepost: '+wrongRoles.join(', ');
+                        warning.title=message;
+                        warning.setAttribute('aria-label',message);
+                        warning.style.cssText='color:#b45c2b;font-size:15px;font-weight:700;cursor:help;';
+                        // Avviso leggibile senza hover e senza allargare il popup.
+                        const note=add(line,'small',missingRole?'guidepost mancante':'ruolo diverso');
+                        note.title=message;
+                        note.style.cssText='color:#b45c2b;font:600 10px/1.2 system-ui,sans-serif;white-space:nowrap;';
+                    }
+                    const link=add(line,'a','↗');
+                    link.href='https://www.openstreetmap.org/relation/'+encodeURIComponent(relItem.id);
+                    link.target='_blank';link.rel='noopener noreferrer';
+                    link.title='Apri la relazione in OSM';link.style.color='#2367b2';
+                    link.addEventListener('click',ev=>ev.stopPropagation());
+                }
+            });
+        };
+        // Conteggio basato sui membri diretti effettivi restituiti da OSM.
+        const sharedCounts=new Map();
+        for(const row of rows){
+            guidepostNodeRelations(row.id).then(relations=>{
+                if(!relations || !table.isConnected) return;
+                sharedCounts.set(String(row.id),relations.length);
+                const mark=table.querySelector('[data-shared-node="'+String(row.id)+'"]');
+                if(mark){mark.textContent=String(relations.length);
+                    mark.title=relations.length+' relazioni totali (inclusa la corrente)';
+                    mark.style.color=relations.length>1?'#b45c2b':'inherit';
+                    mark.style.fontWeight=relations.length>1?'700':'400';}
+            });
+        }
         const buttons=[];
         const select=row=>{
             selectedGuidepostId=String(row.id);
+            detail.style.display='flex';
             showGuidepostPhoto(row);
+            renderRelations(row);
             for(const entry of buttons){
                 const selected=entry.row===row;
                 entry.item.setAttribute('aria-selected',String(selected));
@@ -1594,6 +2035,11 @@
                 if(index===0 || index===4) cell.style.borderLeft='1px solid #8797ac55';
                 cell.title=`${check.key}: ${status}`;cell.setAttribute('aria-label',cell.title);
             });
+            const shared=add(item,'td','');
+            shared.style.cssText='text-align:center;vertical-align:middle;border-left:1px solid #8797ac55;';
+            const value=add(shared,'span','…');
+            value.setAttribute('data-shared-node',String(row.id));
+            value.title='Caricamento numero relazioni OSM';
         });
         const emptyFilter=add(list,'p','');
         emptyFilter.style.cssText='display:none;margin:12px 4px;opacity:.75;font:12px system-ui,sans-serif;';
@@ -1606,7 +2052,9 @@
                 if(visible) count++;
                 else if(String(selectedGuidepostId)===String(entry.row.id)){
                     selectedGuidepostId=null;
+                    detail.style.display='none';
                     showGuidepostPhoto(null);
+                    renderRelations(null);
                     entry.item.setAttribute('aria-selected','false');
                     entry.item.style.background='transparent';
                     orderRenderSignature=null;
@@ -1626,22 +2074,68 @@
         applyGuidepostFilter();
         showOrderMap(pins);
         const batch=add(output,'div','');
+        output.insertBefore(batch,detail);
         batch.style.cssText='display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin:12px 0 0;';
         const editButton=add(batch,'button',`Aggiorna in iD editor (${edits.length} nodi)`);
         editButton.type='button';editButton.disabled=!edits.length;
+        const refreshEditButton=()=>{
+            const pending=new Set(edits.map(n=>String(n.id)));
+            for(const [nodeId,selected] of relationSelections){
+                const available=relationData.get(nodeId)||[];
+                if(available.some(r=>selected.has(String(r.id)) &&
+                    r.members.some(m=>m.type==='node'&&String(m.ref)===nodeId&&m.role==='')))
+                    pending.add(nodeId);
+            }
+            editButton.textContent=`Aggiorna in iD editor (${pending.size} nodi)`;
+            editButton.disabled=!pending.size;
+        };
         editButton.style.cssText='border:1px solid #16764c;border-radius:6px;padding:6px 11px;background:#168358;color:white;font:600 12px system-ui;cursor:pointer;';
+        // Un solo job per iD: nodi + relazione corrente + relazioni extra.
+        // Il grafo deve contenere TUTTE le entità prima di applicare una mutazione.
         editButton.addEventListener('click',()=>{
             if(String(orderRelationId)!==String(relationIdFromUrl()) || !rel ||
-                !Number.isSafeInteger(rel.version)) {alert('Relazione cambiata: ripeti l’analisi.');return;}
-            if(edits.length>250){alert('Troppi nodi per un singolo intervento (massimo 250).');return;}
-            const job={relationId:String(orderRelationId),relationVersion:rel.version,nodes:edits,roles};
+                !Number.isSafeInteger(rel.version)) {
+                alert('Relazione cambiata: ripeti l’analisi.');return;
+            }
+            const pending=new Map(edits.map(node=>[String(node.id),node]));
+            const extraRoles=[];
+            const added=new Set();
+            for(const [nodeId,selected] of relationSelections){
+                if(!selected) continue;
+                for(const other of relationData.get(nodeId)||[]){
+                    const rid=String(other.id);
+                    if(rid===String(orderRelationId) || !selected.has(rid)) continue;
+                    if(!Number.isSafeInteger(other.version) || other.version<1) {
+                        alert('Versione della relazione condivisa non disponibile. Ripeti l’analisi.');return;
+                    }
+                    const row=rows.find(item=>String(item.id)===nodeId);
+                    if(!row?.node || !Number.isSafeInteger(row.node.version)) {
+                        alert('Versione del nodo '+nodeId+' non disponibile. Ripeti l’analisi.');return;
+                    }
+                    for(let index=0;index<other.members.length;index++){
+                        const member=other.members[index];
+                        if(member.type!=='node'||String(member.ref)!==nodeId||member.role!=='') continue;
+                        const key=rid+':'+index;
+                        if(added.has(key))continue;
+                        added.add(key);
+                        if(!pending.has(nodeId)) pending.set(nodeId,{id:nodeId,version:row.node.version,add:{}});
+                        extraRoles.push({relationId:rid,relationVersion:other.version,id:nodeId,index});
+                    }
+                }
+            }
+            const job={relationId:String(orderRelationId),relationVersion:rel.version,
+                nodes:[...pending.values()],roles,extraRoles};
+            if(!job.nodes.length){alert('Nessuna correzione da applicare.');return;}
+            if(job.nodes.length>250||job.roles.length>250||job.extraRoles.length>250){
+                alert('Troppe modifiche: il limite per ogni operazione è 250.');return;
+            }
             const hash='id=relation/'+encodeURIComponent(job.relationId)+
                 '&osm2cai_guideposts='+encodeURIComponent(JSON.stringify(job));
             if(hash.length>90000){alert('Richiesta troppo grande per l’URL di iD.');return;}
-            window.open('https://www.openstreetmap.org/id#'+hash,'_blank','noopener,noreferrer');
+            const url='https://www.openstreetmap.org/id#'+hash;
+            window.open(url,'_blank','noopener,noreferrer');
         });
-        // La foto segue il comando di aggiornamento, non precede il pulsante.
-        batch.after(photoArea);
+        // Foto e selezione relazioni rimangono insieme, sotto la tabella.
         styleGuidepostPopover();
         // Entrambe le analisi inquadrano la geometria dell'intera relazione.
         // Su WMT resta attivo lo zoom nativo; su OSM lo stesso zoom di Analisi geometria.
@@ -2681,7 +3175,7 @@
             const isGuidepost=popup.id==='osm2cai-guidepost-popover';
             set(popup, {'box-sizing':'border-box','position':'absolute',
                 'left':RAIL_WIDTH+'px','top':'100%','right':'auto','bottom':'auto',
-                'margin':'5px 0 0','padding':'0','width':'450px',
+                'margin':'5px 0 0','padding':'0','width':isGuidepost?'570px':'450px',
                 'max-width':'calc(100vw - 24px)','max-height':'70vh',
                 'height':'auto','overflow':'auto','background':'white','border':'1px solid #cbd5e1',
                 'border-radius':isGuidepost?'12px':'8px',
@@ -2862,7 +3356,7 @@
         put(popup, {
             'box-sizing':'border-box', 'position':'absolute',
             'left':RAIL_WIDTH+'px', 'top':'100%', 'right':'auto', 'bottom':'auto',
-            'width':'450px', 'max-width':'calc(100vw - 24px)',
+            'width':'586px', 'max-width':'calc(100vw - 24px)',
             'height':'auto', 'max-height':'70vh', 'margin':'5px 0 0', 'padding':'0',
             'overflow-x':'hidden', 'overflow-y':'auto',
             'background':surface, 'color':foreground, 'color-scheme':dark ? 'dark' : 'light',
@@ -2901,16 +3395,19 @@
             if(filterButtons[2]) put(filterButtons[2], {'color':dark ? '#f4a776' : '#b45c2b'});
         }
         const list=popup.querySelector('.oc-guidepost-table')?.parentElement;
-        put(list, {'box-sizing':'border-box','width':'100%', 'max-height':'min(240px,34vh)',
+        put(list, {'box-sizing':'border-box','width':'552px', 'max-width':'100%', 'max-height':'min(240px,34vh)',
             'overflow-y':'auto','overflow-x':'hidden','position':'relative',
             'margin':'0','padding':'0','background':'transparent'});
         const table=popup.querySelector('.oc-guidepost-table');
-        put(table, {'box-sizing':'border-box','display':'table','width':'100%',
-            'min-width':'0','max-width':'100%','margin':'0','padding':'0',
+        put(table, {'box-sizing':'border-box','display':'table','width':'536px',
+            'min-width':'536px','max-width':'none','margin':'0','padding':'0',
             'border':'0','border-collapse':'separate','border-spacing':'0',
             'table-layout':'fixed','background':'transparent',
             'font':'12px/1.25 system-ui,sans-serif','color':foreground});
-        each('.oc-guidepost-table thead', {'display':'table-header-group'});
+        each('.oc-guidepost-table thead', {
+            'display':'table-header-group','position':'sticky','top':'0',
+            'z-index':'5','background':headerDetail
+        });
         each('.oc-guidepost-table tbody', {'display':'table-row-group'});
         each('.oc-guidepost-table tr', {'display':'table-row','height':'33px',
             'border':'0','margin':'0','padding':'0'});
@@ -2919,8 +3416,8 @@
             const grouped=th.colSpan===4;
             const role=th.rowSpan===2 && th!==popup.querySelector('.oc-guidepost-table thead th:first-child');
             put(th, {
-                'box-sizing':'border-box','display':'table-cell','position':'sticky',
-                'top':secondLevel?'24px':'0','z-index':secondLevel?'4':'3',
+                'box-sizing':'border-box','display':'table-cell','position':'static',
+                'top':'auto','z-index':'auto',
                 'height':th.rowSpan===2?'58px':secondLevel?'34px':'24px',
                 'margin':'0','padding':'2px 1px',
                 'border':'0','border-bottom':'1px solid '+subtleBorder,
@@ -2964,8 +3461,8 @@
             'cursor':editButton?.disabled?'default':'pointer'
         });
         put(popup.querySelector('.oc-guidepost-photo'), {
-            'box-sizing':'border-box','width':'100%',
-            'margin':'10px 0 2px','padding':'0',
+            'box-sizing':'border-box','width':'202px',
+            'margin':'0','padding':'0',
             'background':'transparent','color':foreground,'text-align':'center'
         });
     }
@@ -3042,18 +3539,6 @@
         });
         set(popup.querySelector('.oc-popup-brand'), {
             'display':'flex','flex-direction':'column','min-width':'0','gap':'3px','flex':'1 1 auto'
-        });
-        set(popup.querySelector('.oc-popup-version'), {
-            'font-size':'11px','line-height':'1.4','color':palette.muted
-        });
-        set(popup.querySelector('.oc-popup-close'), {
-            'appearance':'none','-webkit-appearance':'none',
-            'display':'inline-flex','align-items':'center','justify-content':'center',
-            'box-sizing':'border-box','flex':'0 0 28px','width':'28px','height':'28px',
-            'padding':'0','margin':'-2px 0 0','border':'1px solid '+palette.line,
-            'border-radius':'50%','background':palette.button,
-            'font':'600 20px/1 system-ui,sans-serif',
-            'color':dark ? '#a8c7ff' : '#356293','cursor':'pointer'
         });
         set(popup.querySelector('.oc-popup-documentation'), {
             'display':'flex','flex-direction':'column','gap':'10px',
@@ -3179,10 +3664,8 @@
             <div class="oc-popup-content" style="padding:14px 18px 16px;font:13px/1.4 system-ui,-apple-system,sans-serif;">
               <div class="oc-popup-heading">
                 <div class="oc-popup-brand">
-                  <div class="oc-popup-title">OSM2CAI Tools</div>
-                  <div class="oc-popup-version">Versione ${SCRIPT_VERSION} · Strumenti per OpenStreetMap e OSM2CAI</div>
+                  <div class="oc-popup-title">OSM2CAI Tools - ${SCRIPT_VERSION}</div>
                 </div>
-                <button type="button" class="oc-popup-close" id="osm2cai-popup-close" aria-label="Chiudi informazioni" title="Chiudi">×</button>
               </div>
               <div class="oc-popup-documentation">
                 <div class="oc-popup-doc-section">
@@ -3191,6 +3674,7 @@
                     <a href="https://github.com/andrea-del-sarto/OSM2CAI_Tools" target="_blank" rel="noopener noreferrer" title="Apri il progetto su GitHub">GitHub <span aria-hidden="true">↗</span></a>
                     <a href="https://github.com/andrea-del-sarto/OSM2CAI_Tools/blob/main/README.md" target="_blank" rel="noopener noreferrer" title="Presentazione e installazione">README.md <span aria-hidden="true">↗</span></a>
                     <a href="https://github.com/andrea-del-sarto/OSM2CAI_Tools/blob/main/FUNZIONALIT%C3%80.md" target="_blank" rel="noopener noreferrer" title="Guida alle funzionalità">Funzionalità <span aria-hidden="true">↗</span></a>
+                    <a href="${CHANGELOG_URL}" target="_blank" rel="noopener noreferrer" title="Cronologia delle modifiche">CHANGELOG.md <span aria-hidden="true">↗</span></a>
                   </nav>
                 </div>
                 <div class="oc-popup-doc-section">
@@ -3211,12 +3695,13 @@
               <div class="oc-help-table-heading" style="font-size:14px;font-weight:700;margin:14px 0 8px;">Informazioni della barra</div>
               <table class="oc-help-table" style="width:100%;border-collapse:collapse;table-layout:fixed;text-align:left;font-size:13px;line-height:1.4;">
                 <tbody>
-                  <tr><td>OSM2CAI API</td><td>Disponibilità del servizio OSM2CAI.</td></tr>
-                  <tr><td>SDA</td><td>Stato di accatastamento CAI.</td></tr>
-                  <tr><td>Percorribilità</td><td>Stato del percorso e dettagli disponibili.</td></tr>
-                  <tr><td>Data validazione</td><td>Età dell'ultima validazione OSM2CAI.</td></tr>
-                  <tr><td>Allineamento</td><td>Confronto tra le date OSM e OSM2CAI.</td></tr>
-                  <tr><td>Analisi geometria</td><td>Controllo della continuità e possibili problemi.</td></tr>
+                  <tr><td>OSM2CAI API</td><td>Disponibilità del servizio OSM2CAI</td></tr>
+                  <tr><td>SDA</td><td>Stato di accatastamento CAI</td></tr>
+                  <tr><td>Stato di percorribilità</td><td>Stato del percorso e dettagli disponibili</td></tr>
+                  <tr><td>Data validazione</td><td>Data di validazione su OSM2CAI</td></tr>
+                  <tr><td>Allineamento</td><td>Confronto ultima modifica OSM/OSM2CAI, poi geometria e ordine delle way</td></tr>
+                  <tr><td>Analisi geometria</td><td>Controllo della continuità e possibili problemi</td></tr>
+                  <tr><td>Analisi segnaletica verticale</td><td>Verifica dei nodi della segnaletica e dei ruoli guidepost nelle relazioni</td></tr>
                 </tbody>
               </table>
             </div></div>
@@ -3225,7 +3710,7 @@
               <div id="osm2cai-order-results" aria-live="polite" style="margin:0;"></div>
             </div>
           </div>
-          <div class="oc-order-popover" id="osm2cai-guidepost-popover" role="dialog" aria-label="Analisi segnaletica verticale" hidden style="width:450px;max-width:calc(100vw - 24px);z-index:3;border-radius:12px;">
+          <div class="oc-order-popover" id="osm2cai-guidepost-popover" role="dialog" aria-label="Analisi segnaletica verticale" hidden style="width:570px;max-width:calc(100vw - 24px);z-index:3;border-radius:12px;">
             <div style="padding:14px 16px;">
               <div id="osm2cai-guidepost-results" aria-live="polite"></div>
             </div>
@@ -3243,6 +3728,8 @@
           <div id="osm2cai-modified-popup" role="tooltip" hidden></div>`;
         // Fondament: direttamente su body, non dentro #map o sidebar (che OSM può rimpiazzare).
         document.body.appendChild(bar);
+        // Dopo la prima apertura di una relazione supportata, mostra le novità una sola volta.
+        setTimeout(() => { if (bar.isConnected) showVersionChangelogOnce(); }, 350);
         // Firefox: il solo stopPropagation non era sufficiente per aprire
         // questi due collegamenti sulla pagina OSM/WMT. Per il normale clic
         // sinistro usiamo il gestore userscript, che apre una vera scheda.
@@ -3293,9 +3780,11 @@
         const orderClose = $('order-close');
         const guidepostPopover=$('guidepost-popover');
         guidepostPopover?.addEventListener('click',event=>{
-            if(event.target.closest('.oc-guidepost-table,.oc-guidepost-photo')) return;
+            if(event.target.closest('.oc-guidepost-table,.oc-guidepost-photo,.oc-guidepost-relations')) return;
             if(selectedGuidepostId===null) return;
             selectedGuidepostId=null;
+            const details=guidepostPopover.querySelector('.oc-guidepost-details');
+            if(details) details.style.display='none';
             const photo=guidepostPopover.querySelector('.oc-guidepost-photo');
             if(photo){photo.replaceChildren();photo.hidden=true;}
             for(const row of guidepostPopover.querySelectorAll('.oc-guidepost-table tbody tr')){
@@ -3454,11 +3943,6 @@
         });
         const button = $('info-button');
         const popover = $('popover');
-        $('popup-close')?.addEventListener('click', () => {
-            popover.hidden = true;
-            button?.setAttribute('aria-expanded', 'false');
-            applyInlineLayout();
-        });
         button?.addEventListener('click', () => {
             closeGuidepostPopover();
             popover.hidden = !popover.hidden;
@@ -4129,37 +4613,104 @@
         }
     }
 
-    // SDA 4: confronta OSM con validation_date; se OSM è più recente,
-    // segnala "da verificare". SDA 1, 2, 3: confronta con updated_at;
-    // se OSM è più recente, segnala "da aggiornare".
-    // Nessun fallback tra i due campi: SDA 0 o date non confrontabili => grigio.
-    function fillAlignment(data, osmDate) {
+    // Seconda verifica: confronta le way (nell'ordine dei membri OSM) con
+    // le singole LineString OSM2CAI, soltanto dopo il controllo prudenziale
+    // delle date.
+    // Ritorna null se non è possibile stabilire una corrispondenza attendibile.
+    function compareOsm2caiGeometry(full, relationId, data) {
+        const geo = data?.geometry || data?.features?.[0]?.geometry;
+        if (!geo || geo.type !== 'MultiLineString' || !Array.isArray(geo.coordinates)) return null;
+        const expanded = relationGeometryMembers(full, relationId);
+        if (expanded.missing.length || expanded.cycles.length) return null;
+        const members = expanded.members;
+        const lines = geo.coordinates;
+        if (!members.length || !lines.length || members.length > 10000 || lines.length > 10000) return null;
+        const elements = full?.elements;
+        if (!Array.isArray(elements)) return null;
+        const ways = new Map(elements.filter(e => e?.type === 'way').map(e => [String(e.id),e]));
+        const nodes = new Map(elements.filter(e => e?.type === 'node').map(e => [String(e.id),e]));
+        const coords = [];
+        for (const member of members) {
+            const way = ways.get(String(member.ref));
+            if (!Array.isArray(way?.nodes) || way.nodes.length < 2 || way.nodes.length > 100000) return null;
+            const points = [];
+            for (const id of way.nodes) {
+                const n = nodes.get(String(id));
+                if (!Number.isFinite(n?.lon) || !Number.isFinite(n?.lat) ||
+                    Math.abs(n.lon) > 180 || Math.abs(n.lat) > 90) return null;
+                points.push([n.lon,n.lat]);
+            }
+            coords.push(points);
+        }
+        // Controlla la forma dei dati ricevuti. Una geometria mancante o
+        // non numerica NON equivale a una modifica OSM rilevata.
+        for (const line of lines) {
+            if (!Array.isArray(line) || line.length < 2 || line.length > 100000 ||
+                line.some(p => !Array.isArray(p) || p.length < 2 ||
+                    !Number.isFinite(p[0]) || !Number.isFinite(p[1]) ||
+                    Math.abs(p[0]) > 180 || Math.abs(p[1]) > 90)) return null;
+        }
+        if (coords.length !== lines.length) return false;
+        // OSM2CAI pubblica fino a ~7 decimali. La tolleranza di 1.5e-7 gradi
+        // copre il solo arrotondamento, non modifiche reali del tracciato.
+        const equalPoint = (a,b) => Math.abs(a[0]-b[0]) <= 1.5e-7 &&
+                                     Math.abs(a[1]-b[1]) <= 1.5e-7;
+        const equalLine = (a,b) => {
+            if (a.length !== b.length) return false;
+            let forward=true,reverse=true;
+            for (let i=0;i<a.length;i++) {
+                if (forward && !equalPoint(a[i],b[i])) forward=false;
+                if (reverse && !equalPoint(a[i],b[b.length-1-i])) reverse=false;
+                if (!forward && !reverse) return false;
+            }
+            return forward || reverse;
+        };
+        return coords.every((line,index) => equalLine(line,lines[index]));
+    }
+    // Prima fase: verifica prudenziale delle date, senza assumere che
+    // updated_at coincida con l'istante effettivo di sincronizzazione.
+    // SDA 1-3: sottrai 48 ore a updated_at; SDA 4: validation_date non
+    // subisce la sottrazione. SDA 0 e date incomplete restano neutrali.
+    const OSM2CAI_SYNC_LAG_MS = 48 * 60 * 60 * 1000;
+    function alignmentDateGate(full, relationId, data) {
         const p = data?.properties || {};
         const sda = String(p.sda ?? '').trim();
-        let kind = 'gray';
-        let message = 'non verificabile';
-        const osmMs = parseApiDate(osmDate);
-        const source = sda === '4' ? p.validation_date :
-            ['1', '2', '3'].includes(sda) ? p.updated_at : null;
-        if (Number.isFinite(osmMs) && typeof osmDate === 'string' &&
-            /^\d{4}-\d{2}-\d{2}T/.test(osmDate) && typeof source === 'string') {
-            const stamp = source.trim();
-            const sourceMs = parseApiDate(stamp);
-            if (Number.isFinite(sourceMs)) {
-                // Le date senza orario vengono confrontate a livello di giorno.
-                const aligned = /^\d{4}-\d{2}-\d{2}$/.test(stamp)
-                    ? stamp >= osmDate.slice(0, 10)
-                    : sourceMs >= osmMs;
-                kind = aligned ? 'ok' : 'error';
-                message = aligned ? 'aggiornato' :
-                    (sda === '4' ? 'da verificare' : 'da aggiornare');
-            }
+        if (!['1','2','3','4'].includes(sda)) return null;
+        const osmStamp = latestRelationWayTimestamp(full, relationId);
+        const osmMs = parseApiDate(osmStamp);
+        if (!Number.isFinite(osmMs)) return null;
+        const raw = sda === '4' ? p.validation_date : p.updated_at;
+        if (typeof raw !== 'string') return null;
+        const stamp = raw.trim();
+        const sourceMs = parseApiDate(stamp);
+        if (!Number.isFinite(sourceMs)) return null;
+        if (sda === '4' && /^\d{4}-\d{2}-\d{2}$/.test(stamp)) {
+            // Come nel confronto precedente, la validazione priva di orario
+            // si confronta per giorno (non presume le 00:00 UTC).
+            return stamp >= osmStamp.slice(0,10);
         }
-        status('sync', kind, message);
+        return (sourceMs - (sda === '4' ? 0 : OSM2CAI_SYNC_LAG_MS)) >= osmMs;
+    }
+    // Seconda fase soltanto quando le date danno esito positivo.
+    // Errore di rete o dati insufficienti => stato neutro; non un falso rosso.
+    function fillAlignment(full, relationId, data) {
+        const dateAligned = alignmentDateGate(full, relationId, data);
+        if (dateAligned === null) {
+            status('sync','gray','—');
+            return;
+        }
+        if (!dateAligned) {
+            status('sync','error','non aggiornato');
+            return;
+        }
+        const geometryAligned = compareOsm2caiGeometry(full, relationId, data);
+        if (geometryAligned === null) status('sync','gray','—');
+        else status('sync',geometryAligned ? 'ok' : 'error',
+            geometryAligned ? 'aggiornato' : 'non aggiornato');
     }
     function apiError() {
         status('status', 'error', 'errore');
-        status('sync', 'gray', 'non verificabile');
+        status('sync', 'gray', '—');
     }
 
     // /relation/ID/full include la geometria dei membri diretti, NON quella
@@ -4237,6 +4788,7 @@
         if (recreate && !document.getElementById('osm2cai-bar')) { newPanel(relationId); }
         if (collapsed) { return; } // Nessuna richiesta API con barra chiusa.
         resetModifiedElements();
+        status('sync', 'gray', '—');
         closeIssuesPopover();
         setIssuesDetails(null);
         orderFull = null;
@@ -4263,14 +4815,19 @@
             if (!isCurrent() || unsupportedRoute || !osmFinished || !caiFinished) { return; }
             currentLoad.state = 'complete';
             if (data) {
-                fillAlignment(data, latestRelationWayTimestamp(full, relationId));
-                const p = data?.properties || {};
-                modifiedAfterValidation = String(p.sda ?? '').trim() === '4' &&
-                    $('sync')?.textContent === 'da verificare'
-                    ? modifiedElementsSince(full, p.validation_date) : [];
+                fillAlignment(full, relationId, data);
+                // Il dettaglio al passaggio del mouse è riservato a SDA 4 e
+                // soltanto alle modifiche OSM successive a validation_date.
+                // Se è la geometria (non la data) a fallire, non mostrare
+                // un elenco fuorviante di modifiche post-validazione.
+                const props = data.properties || {};
+                const dateGate = String(props.sda ?? '').trim() === '4'
+                    ? alignmentDateGate(full, relationId, data) : null;
+                modifiedAfterValidation = dateGate === false
+                    ? modifiedElementsSince(full, props.validation_date) : [];
                 hideModifiedPopup();
             } else {
-                status('sync', 'gray', 'non verificabile');
+                status('sync', 'gray', '—');
             }
         }
 
@@ -4298,10 +4855,11 @@
             if (!isCurrent()) { return; }
             full = result;
             // Escludi i percorsi non supportati prima di scaricarne i figli.
-            // Solo route=hiking è ammesso, anche nelle super-relazioni.
+            // Su OSM ammetti solo route=hiking, anche nelle super-relazioni;
+            // su hiking.waymarkedtrails.org il filtro è già applicato dal sito.
             const osmRelation = full?.elements?.find(item =>
                 item.type === 'relation' && String(item.id) === String(relationId));
-            if (osmRelation?.tags?.route !== 'hiking') {
+            if (!isWmt() && osmRelation?.tags?.route !== 'hiking') {
                 unsupportedRoute = true;
                 cancelRequests();
                 removePanel();
@@ -4361,17 +4919,36 @@
             }
             cancelRequests();
             relationIdShown = id;
-            // Nessuna barra (nemmeno compressa) prima della verifica OSM.
-            removePanel();
+            // WMT: nel passaggio A -> B conserva la stessa barra e lo stato
+            // aperto/compattato; svuota immediatamente i dati di A in attesa di B.
+            // Su OSM resta invariata la verifica prima di mostrare la barra.
+            const reuseWmtBar = isWmt() && Boolean(document.getElementById('osm2cai-bar'));
+            if (reuseWmtBar) {
+                clearOrderMap();
+                closeGuidepostPopover();
+                closeIssuesPopover();
+                const orderPopup = $('order-popover');
+                if (orderPopup) { orderPopup.hidden = true; orderPopup.style.setProperty('display','none','important'); }
+                resetPanelForRelation(id);
+                setMemberOrderIndicator('gray');
+                updateGuidepostIndicator(null, id);
+            } else {
+                removePanel();
+            }
             const checkTicket = sequence;
             getJson('https://api.openstreetmap.org/api/0.6/relation/' + id + '/full.json')
                 .then(full => {
                     if (checkTicket !== sequence || id !== relationIdFromUrl() || isOsmEditing()) return;
                     const relation = full?.elements?.find(item =>
                         item.type === 'relation' && String(item.id) === String(id));
-                    // In caso di errore API, tag assente o altra route: resta nascosta.
-                    if (relation?.tags?.route !== 'hiking') return;
-                    newPanel(id);
+                    // Su OSM richiedi route=hiking; su WMT non ripetere questo filtro.
+                    // In entrambi i casi, serve una relazione OSM valida.
+                    if (!relation || (!isWmt() && relation.tags?.route !== 'hiking')) {
+                        // Su WMT un errore di rete non deve nascondere la barra.
+                        if (reuseWmtBar) status('status', 'gray', 'Dati OSM non disponibili');
+                        return;
+                    }
+                    if (!reuseWmtBar || !document.getElementById('osm2cai-bar')) newPanel(id);
                     if (!collapsed) {
                         resetPanelForRelation(id);
                         load(id, false, full);

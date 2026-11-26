@@ -19,6 +19,7 @@ Per i requisiti e l'installazione, consulta [README.md](README.md).
 - [3 - Analisi segnaletica verticale](#3---analisi-segnaletica-verticale)
   - [3.1 - Verifiche e indicatore di stato](#31---verifiche-e-indicatore-di-stato)
   - [3.2 - Tabella e mappa](#32---tabella-e-mappa)
+  - [3.3 - Relazioni condivise e fotografie Wikimedia Commons](#33---relazioni-condivise-e-fotografie-wikimedia-commons)
   - [3.4 - Correzione massiva nell'iD editor](#34---correzione-massiva-nellid-editor)
 - [4 - Limiti e avvertenze](#4---limiti-e-avvertenze)
 
@@ -28,15 +29,15 @@ Per i requisiti e l'installazione, consulta [README.md](README.md).
 
 Aprendo una relazione escursionistica su [OpenStreetMap](https://www.openstreetmap.org/) o [Waymarked Trails](https://hiking.waymarkedtrails.org/), OSM2CAI Tools mostra una barra con le informazioni disponibili attraverso il servizio OSM2CAI e con gli strumenti di analisi della relazione.
 
-Il pulsante **`?`** apre un riepilogo dei controlli. Le spiegazioni complete sono riportate qui sotto.
+Il pulsante **`?`** apre un riepilogo dei controlli, della legenda e dei collegamenti alla documentazione. Le spiegazioni complete sono riportate qui sotto.
 
 | Campo | Funzione |
 | :--- | :--- |
 | **OSM2CAI API** | Indica se il servizio OSM2CAI risponde correttamente. |
 | **SDA** | Mostra il codice dello stato di accatastamento del percorso nel database CAI: **0, 1, 2, 3 o 4**. |
-| **Percorribilità** | Mostra lo stato del percorso, quando disponibile. Passando il puntatore sul campo si aprono i dettagli. |
+| **Stato di percorribilità** | Mostra lo stato del percorso e, quando disponibili, i dettagli al passaggio del puntatore. |
 | **Data validazione** | Riporta l'ultima data di validazione OSM2CAI. Il colore indica quanto tempo è trascorso. |
-| **Allineamento** | Confronta le date delle modifiche OSM con la data di riferimento OSM2CAI. |
+| **Allineamento** | Confronta l’ultima modifica OSM con la data di riferimento OSM2CAI e, se il confronto temporale è positivo, verifica geometria e ordine delle way. |
 | **Analisi geometria** | Verifica la continuità delle way, segnala problemi e, nei casi non ambigui, può proporre un riordino. |
 | **Analisi segnaletica verticale** | Controlla i guidepost della relazione e consente di preparare nell’iD editor di OpenStreetMap le correzioni dei tag mancanti e dei ruoli vuoti. |
 
@@ -76,25 +77,27 @@ Il colore della data indica il tempo trascorso dall'ultima validazione OSM2CAI, 
 
 Una validazione recente non garantisce, da sola, che tutti i dati OSM siano corretti o aggiornati.
 
-### 1.4 - Allineamento con OpenStreetMap
+### 1.4 -  Allineamento OpenStreetMap ↔ OSM2CAI
 
-Il controllo confronta la modifica più recente degli elementi della relazione OSM (**relazioni, way e nodi**) con una data di riferimento OSM2CAI, diversa in base allo stato SDA.
+La verifica dell’allineamento si svolge in **due fasi**. La prima confronta la modifica più recente degli elementi OSM della relazione (**relazioni, way e nodi**) con la data di riferimento OSM2CAI. La seconda fase, eseguita **solo se il confronto delle date è positivo**, confronta la **geometria e l’ordine delle way** con i dati OSM2CAI.
 
-| Stato di accatastamento                            | Dato OSM2CAI utilizzata | Stati possibili                           |
-| :------------------------------------------------- | :---------------------- | :---------------------------------------- |
-| **4**                                              | `validation_date`       | 🟢 **aggiornato**<br>🔴 **da verificare** |
-| **1, 2, 3**                                        | `updated_at`            | 🟢 **aggiornato**<br>🔴 **da aggiornare** |
-| **0**, oppure dati temporali mancanti o non validi | Non disponibile         | ⚪ **non verificabile**                    |
+| Stato di accatastamento | Prima fase: data OSM2CAI utilizzata | Seconda fase | Esiti |
+| :--- | :--- | :--- | :--- |
+| **1, 2, 3** | `updated_at` **meno 48 ore**, come margine prudenziale per il ritardo di sincronizzazione | Geometria e ordine delle way, se le date sono compatibili | 🟢 **aggiornato** / 🔴 **non aggiornato** |
+| **4** | `validation_date`, **senza sottrarre 48 ore** | Geometria e ordine delle way, se le date sono compatibili | 🟢 **aggiornato** / 🔴 **non aggiornato** |
+| **0** | Nessun confronto | Non eseguita | ⚪ **—** |
 
-- **Aggiornato:** non risultano modifiche OSM successive alla data OSM2CAI utilizzata dal controllo.
-- **Da verificare / da aggiornare:** risultano modifiche successive, da esaminare. Questo **non significa automaticamente** che ci siano errori.
-- **Non verificabile:** mancano le condizioni o le informazioni necessarie per effettuare il confronto.
+- **Aggiornato:** entrambe le verifiche sono state superate
+- **Non aggiornato:** il confronto temporale indica modifiche OSM successive alla data di riferimento oppure la geometria o l’ordine delle way non corrispondono
+- **— (stato neutro):** dati mancanti, non validi o insufficienti per una verifica affidabile
+
+Le **48 ore** applicate a `updated_at` rappresentano un criterio prudenziale: la data di aggiornamento del record non dimostra, da sola, quale versione dei dati OSM sia stata importata. La verifica della geometria non garantisce la corrispondenza puntuale di tutti i tag.
 
 #### 1.4.1 - Dettaglio delle modifiche OSM (SDA 4)
 
-Con **SDA 4** e stato **da verificare**, passando il puntatore sul campo *Allineamento* si apre l'elenco degli elementi modificati dopo la validazione.
+Con **SDA 4**, quando l’allineamento risulta **non aggiornato a causa di modifiche OSM successive a `validation_date`**, passando il puntatore sul campo *Allineamento* si apre l’elenco degli elementi modificati dopo la validazione.
 
-L'elenco:
+L’elenco:
 
 - raggruppa gli elementi per tipo: **relation**, **way**, **node**;
 - ordina gli elementi di ciascun tipo dal più recente al meno recente;
@@ -102,7 +105,7 @@ L'elenco:
 - permette di aprire l'elemento su OpenStreetMap selezionando tipo e ID;
 - visualizza al massimo **80 elementi**, segnalando il totale quando superiore.
 
-> **Importante:** l'allineamento si basa sulle **date di modifica**. Non confronta in modo puntuale i tag né ricostruisce e confronta due geometrie storiche OSM/OSM2CAI.
+Il dettaglio è disponibile **solo per SDA 4** e **non compare** se l’esito «non aggiornato» deriva esclusivamente dalla seconda verifica, cioè da differenze di geometria o ordine delle way. Per SDA 0–3 non è previsto questo popup diagnostico.
 
 ---
 
@@ -192,18 +195,31 @@ Se coesistono anomalie diverse, la priorità è **rosso → arancione → verde*
 
 Il riepilogo contiene tre contatori cliccabili, **Totale**, **Conformi** e **Da verificare**: la selezione mostra rispettivamente tutti i nodi, solo quelli conformi oppure solo quelli che richiedono verifica (inclusi gli elementi non verificabili). Quando un filtro non ha risultati, viene mostrato un messaggio al posto della tabella. 
 
-La tabella ha un’**intestazione raggruppata su due livelli**: **ID nodo**, **Tag** (quattro sottocolonne: `tourism`, `information`, `hiking` e **wikimedia / commons**, quest’ultima su due righe) e **Ruolo membro** (su due righe). **ID nodo** e **Ruolo membro** sono centrati orizzontalmente e verticalmente; spunte, avvisi e trattini sono centrati nelle rispettive celle. La presenza del tag `wikimedia_commons` è informativa: **la sua assenza non costituisce un errore**.
+La tabella ha un’**intestazione raggruppata su due livelli**: **ID nodo**, **Tag** (quattro sottocolonne: `tourism`, `information`, `hiking` e **wikimedia / commons**, **Ruolo membro** e **Numero relazioni**. 
+La colonna **Numero relazioni** indica quante relazioni OSM contengono il nodo, inclusa quella attualmente analizzata. 
+La presenza del tag `wikimedia_commons` è informativa: **la sua assenza non costituisce un errore**.
 
-- L'intestazione resta fissa durante lo scorrimento; la tabella visualizza fino a cinque righe prima dello scorrimento verticale, con adattamento agli schermi piccoli.
 - Gli ID dei nodi sono collegamenti cliccabili che aprono `https://www.openstreetmap.org/node/ID` in una nuova scheda.
-- All'apertura **nessun nodo è selezionato**. Selezionando una riga viene evidenziato il nodo corrispondente sulla mappa; un clic all'interno del popup ma fuori dalla tabella elimina la selezione e l'evidenziazione.
-- Se il nodo selezionato contiene `wikimedia_commons` riferito a un **file** di Commons, sotto il pulsante di aggiornamento nell’iD editor compare una **miniatura**; cliccandola si apre la foto **a schermo intero** (chiusura con `Esc` o clic sullo sfondo/X). Durante la richiesta compare **«Caricamento...»**. Se il tag manca non compare nulla; una categoria Commons non viene interpretata come un file fotografico.
+- All'apertura **nessun nodo è selezionato**. Selezionando una riga viene evidenziato il nodo corrispondente sulla mappa.
+- Quando si seleziona un nodo, sotto il pulsante di aggiornamento nell’iD editor compare un’area di dettaglio con le **relazioni condivise a sinistra** e l’eventuale **fotografia Wikimedia Commons a destra**. 
+  Le miniature sono richieste a Wikimedia Commons con larghezza di circa **240 px**; cliccando sull’immagine si apre la foto **a schermo intero**.
 - I pin numerati della segnaletica appaiono automaticamente sulla mappa: **verdi** per i conformi, **arancioni** per tag o ruolo mancanti e **rossi** per errori certi o duplicati. Lo script tenta di inquadrare i guidepost su OSM e utilizza la gestione della vista prevista su WMT.
 - L'analisi segnaletica è separata da quella topologica: passando da una all'altra, o chiudendo il popup, vengono rimossi i pin della precedente analisi.
 
+### 3.3 - Relazioni condivise e fotografie Wikimedia Commons
+
+La colonna **Numero relazioni** permette di riconoscere i nodi utilizzati da più relazioni. Selezionando un nodo, il riquadro **Relazioni condivise** elenca le altre relazioni che lo contengono, identificandole tramite il tag **`ref`**. Se non esistono altre relazioni, il riquadro mostra **«nessuna»**.
+
+- Ogni relazione condivisa ha una **checkbox**, un collegamento a OSM e l’indicazione del ruolo del nodo in quella specifica relazione
+- Se il ruolo è già `guidepost`, compare **«guidepost presente»** in verde e la checkbox è inizialmente selezionata
+- Se il ruolo manca oppure è diverso da `guidepost`, compare un avviso; le selezioni manuali consentono di scegliere quali relazioni includere nella correzione
+- I **tag appartengono al nodo**, mentre il **ruolo è specifico del membro in ciascuna relazione**: un nodo può quindi avere il ruolo corretto in un percorso e mancante in un altro
+
+Le selezioni del riquadro concorrono alla preparazione degli aggiornamenti in iD. La miniatura fotografica resta nella colonna a destra e non condiziona la visualizzazione delle relazioni condivise.
+
 ### 3.4 - Correzione massiva nell'iD editor
 
-Il pulsante **Aggiorna in iD editor (N nodi)**, sotto la tabella e sopra l’eventuale miniatura Wikimedia, apre senza popup intermedi di conferma una nuova scheda dell’iD editor di OpenStreetMap e tenta di preparare **in una sola sessione di modifica** le correzioni per tutti i nodi problematici correggibili. Può aggiungere i tag attesi quando sono assenti (`tourism=information`, `information=guidepost`, `hiking=yes`) e assegnare il ruolo `guidepost` ai membri che hanno il ruolo vuoto.
+Il pulsante **Aggiorna in iD editor (N nodi)**, sotto la tabella e sopra i dettagli del nodo selezionato, apre senza popup intermedi di conferma una nuova scheda dell’iD editor di OpenStreetMap e tenta di preparare **in una sola sessione di modifica** le correzioni per tutti i nodi problematici correggibili. Può aggiungere i tag attesi quando sono assenti (`tourism=information`, `information=guidepost`, `hiking=yes`) e assegnare il ruolo `guidepost` ai membri che hanno il ruolo vuoto. Le **relazioni condivise selezionate** possono essere incluse nella stessa operazione di correzione del ruolo; prima dell’applicazione lo script verifica che tutte le entità e le versioni necessarie corrispondano a quelle analizzate.
 
 **Non sovrascrive automaticamente tag con valori diversi da quelli attesi** e non corregge in automatico i casi ambigui, come membri duplicati. Il trasferimento all’iD editor richiede che la relazione e i nodi necessari siano disponibili e corrispondano alla versione analizzata. Lo script tenta di caricare gli oggetti mancanti, ma l'integrazione può non riuscire: in tal caso non deve applicare correzioni parziali. Le modifiche eventualmente preparate restano **non salvate**, da verificare ed eventualmente salvare manualmente nell'editor.
 
@@ -216,5 +232,5 @@ Il controllo riguarda i guidepost censiti come membri della relazione: **non cer
 - **Analisi topologica:** un incrocio geometrico senza un nodo OSM condiviso non costituisce un collegamento. Anche un grafo connesso non garantisce la correttezza di tag, ruoli o geometria.
 - **Strutture complesse:** geometrie non disponibili, grandi *superroute* e relazioni molto annidate possono impedire l’analisi completa; in tali casi i risultati possono essere **incompleti** e richiedono una verifica manuale.
 - **Integrazione con l’iD editor:** dipende anche da componenti interni dell'editor, che potrebbero cambiare con i suoi aggiornamenti. L'apertura della scheda non garantisce, da sola, che le correzioni siano state applicate.
-- **Dati OSM2CAI:** le informazioni mostrate dipendono dalla disponibilità e dal contenuto delle risposte del servizio.
+- **Dati OSM2CAI:** le informazioni mostrate dipendono dalla disponibilità e dal contenuto delle risposte del servizio. Il criterio di allineamento in due fasi non costituisce una certificazione della sincronizzazione completa dei tag.
 - **Modifiche ai dati OSM:** OSM2CAI Tools non salva automaticamente modifiche sui server OpenStreetMap. Qualsiasi modifica preparata nell’iD editor richiede la verifica e il salvataggio manuale.

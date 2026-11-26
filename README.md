@@ -1,50 +1,59 @@
 # OSM2CAI Tools
 
-**OSM2CAI Tools** è uno _userscript_ dedicato ai mappatori di OpenStreetMap (OSM) focalizzati sulla **Rete Escursionistica Italiana (REI)**. Il suo obiettivo primario è semplificare la verifica dei percorsi escursionistici e facilitare l'integrazione dei dati con **OSM2CAI**, la piattaforma del Club Alpino Italiano (CAI).
+**OSM2CAI Tools** è uno *userscript* per **Violentmonkey** e **Tampermonkey**, nato come strumento personale per rendere più agevole l'attività di mappatura e manutenzione dei **percorsi escursionistici su OpenStreetMap (OSM)**, con particolare attenzione alla **Rete Escursionistica Italiana (REI)** e ai percorsi CAI.
+
+L'obiettivo è ridurre le operazioni ripetitive e **contribuire alla qualità, alla coerenza e alla consistenza dei dati OSM**, facilitando l'individuazione di anomalie geometriche, informazioni mancanti e incongruenze nelle relazioni dei percorsi.
 
 ![Barra principale di OSM2CAI Tools](screenshot/OSM2CAI_tools-barra%20principale.png)
 
 *Barra principale di OSM2CAI Tools su OpenStreetMap.*
 
-Il progetto nasce come collegamento tra OSM e OSM2CAI. Oggi affianca alla consultazione delle informazioni CAI strumenti per **analizzare le relazioni escursionistiche, riconoscere anomalie e preparare il riordino dei membri nell'iD editor**.
+Il progetto è cresciuto a partire dalla necessità di passare frequentemente tra **OpenStreetMap**, **Waymarked Trails** e **OSM2CAI** per confrontare informazioni, analizzare le relazioni e controllare la segnaletica verticale. Oggi riunisce diverse verifiche in un'interfaccia dedicata, senza sostituire gli strumenti di mappatura esistenti.
 
-> ⚠️ **Accesso riservato:** la piattaforma OSM2CAI è disponibile **solo per i soci del CAI**.
+> **Accesso a OSM2CAI:** la piattaforma OSM2CAI è riservata ai soci del Club Alpino Italiano (CAI). Alcune funzioni richiedono l'accesso al servizio.
 
-> **Ambito:** la barra informativa OSM2CAI è la componente principale dell'interfaccia. Gli strumenti di analisi delle relazioni possono essere utili anche per percorsi non italiani, ma i dati specifici OSM2CAI dipendono dal servizio CAI.
+> **Ambito:** gli strumenti di analisi delle relazioni possono essere utili anche per percorsi non italiani; i dati specifici OSM2CAI dipendono invece dal servizio CAI.
 
 ## Funzionalità
 
-- **Consultazione OSM2CAI:** dati API relativi a SDA, percorribilità, validazione e allineamento con OSM.
+- **Collegamenti e consultazione:** passaggio rapido tra OpenStreetMap, Waymarked Trails e OSM2CAI, con visualizzazione di SDA, stato di percorribilità e data di validazione.
+- **Allineamento OSM–OSM2CAI:** verifica in due fasi. Prima viene confrontata l'ultima modifica OSM, considerando anche gli elementi della relazione, con `updated_at` meno **48 ore** per SDA 1–3 oppure con `validation_date` per SDA 4; se il confronto temporale è positivo, vengono controllate anche **geometria e ordine delle way**. Quando i dati non consentono una verifica affidabile, viene mostrato uno stato neutro.
+- **Dettaglio dell'allineamento per SDA 4:** se il percorso risulta «non aggiornato» per modifiche OSM successive a `validation_date`, passando il mouse su **Allineamento** compare l'elenco degli elementi modificati, con tipo, ID, data, utente e collegamento a OpenStreetMap.
 - **Analisi geometria:** verifica della continuità del percorso, biforcazioni, anelli, relazioni annidate e anomalie, con indicatori sulla mappa.
-- **Riordino in iD editor:** proposta di riordino dei membri `way` quando la geometria non è ambigua, con verifica e salvataggio manuale.
-- **Analisi segnaletica verticale:** verifica dei guidepost presenti nella relazione, controllando tag OSM, ruoli e conformità, con pin numerati e filtri interattivi.
-- **Aggiornamento dei nodi in iD editor:** correzione massiva dei tag mancanti e dei ruoli vuoti dei guidepost, con verifica e salvataggio manuale.
-- **Fotografie Wikimedia Commons:** visualizzazione delle miniature associate ai guidepost, ingrandibili a schermo intero.
-- **Integrazione Waymarked Trails:** analisi delle relazioni e apertura automatica del profilo altimetrico.
+- **Riordino dei membri in iD:** proposta di riordino dei membri `way` quando la geometria lo consente.
+- **Analisi segnaletica verticale:** controllo dei nodi `guidepost`, dei tag OSM e dei ruoli nelle relazioni, anche quando un nodo è condiviso tra più percorsi, con pin numerati e filtri interattivi.
+- **Supporto alle correzioni in iD:** preparazione delle integrazioni dei tag mancanti e dei ruoli `guidepost` nelle relazioni interessate.
+- **Fotografie Wikimedia Commons:** visualizzazione delle miniature associate alla segnaletica verticale, ingrandibili a schermo intero.
+- **Integrazione Waymarked Trails:** analisi delle relazioni e apertura del profilo altimetrico.
 
-Per legenda, dettagli di ogni campo, popup, comportamento dell’analisi e limiti noti, consulta la **[guida alle funzionalità](FUNZIONALIT%C3%80.md)**.
+**Importante:** OSM2CAI Tools **non salva automaticamente modifiche su OpenStreetMap**. Tutte le modifiche proposte vengono preparate nell'**editor iD** e devono essere **controllate dal mappatore prima del salvataggio manuale**, indipendentemente dalla funzione utilizzata.
+
+Per legenda, dettagli dei campi, popup e limiti noti, consulta la **[guida alle funzionalità](FUNZIONALIT%C3%80.md)**. Per la cronologia degli aggiornamenti, consulta il **[changelog](CHANGELOG.md)**.
 
 ## Requisiti
 
 - Browser moderno con supporto a JavaScript ES6+.
-- Gestore di script: [Violentmonkey](https://violentmonkey.github.io/) (open source) o [Tampermonkey](https://www.tampermonkey.net/).
+- Gestore di userscript: [Violentmonkey](https://violentmonkey.github.io/) (open source) oppure [Tampermonkey](https://www.tampermonkey.net/).
 - Connessione ai servizi OSM e OSM2CAI per le funzioni che richiedono API.
 
-La piattaforma OSM2CAI è **riservata ai soci CAI**; per accedervi possono essere necessarie le credenziali [MyCAI](https://soci.cai.it/). L'uso delle pagine OSM e dei rispettivi dati pubblici è distinto dall'accesso alla piattaforma CAI.
+La piattaforma OSM2CAI è **riservata ai soci CAI**; per accedervi sono necessarie le credenziali [MyCAI](https://soci.cai.it/). L'utilizzo delle pagine OSM e dei rispettivi dati pubblici è distinto dall'accesso alla piattaforma CAI.
 
 ## Installazione
 
-1. Installa Violentmonkey o Tampermonkey.
-2. Installa lo script [`OSM2CAI_Tools.user.js`](https://github.com/andrea-del-sarto/OSM2CAI_Tools/raw/refs/heads/main/OSM2CAI_Tools.user.js)
+1. Installa Violentmonkey o Tampermonkey nel browser.
+2. Installa lo script [`OSM2CAI_Tools.user.js`](https://github.com/andrea-del-sarto/OSM2CAI_Tools/raw/refs/heads/main/OSM2CAI_Tools.user.js).
 3. Apri una relazione di percorso escursionistico su OpenStreetMap o Waymarked Trails.
 
 ## Esempi di utilizzo
 
 ### OpenStreetMap
+
 https://www.openstreetmap.org/relation/136334
 
 ### Waymarked Trails
+
 https://hiking.waymarkedtrails.org/#route?id=136334
+
 
 ## Documentazione utile
 
