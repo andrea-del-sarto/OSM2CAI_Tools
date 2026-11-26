@@ -1,10 +1,11 @@
+
 // ==UserScript==
 // @name         OSM2CAI Tools
 // @namespace    https://osm2cai.cai.it/
 // @version      0.14.0
 // @updateURL    https://raw.githubusercontent.com/andrea-del-sarto/OSM2CAI_Tools/main/OSM2CAI_Tools.user.js
 // @downloadURL  https://raw.githubusercontent.com/andrea-del-sarto/OSM2CAI_Tools/main/OSM2CAI_Tools.user.js
-// @homepageURL   https://github.com/andrea-del-sarto/OSM2CAI_Tools
+// @homepageURL  https://github.com/andrea-del-sarto/OSM2CAI_Tools
 // @description  Strumenti per consultare OSM2CAI, verificare i percorsi escursionistici e riordinare le relazioni OSM.
 // @author       andrea-del-sarto
 // @license      GPL-3.0-only
@@ -13,12 +14,15 @@
 // @match        https://hiking.waymarkedtrails.org/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_info
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @grant        GM_openInTab
 // @grant        unsafeWindow
 // @connect      osm2cai.cai.it
 // @connect      api.openstreetmap.org
 // @connect      commons.wikimedia.org
 // @connect      upload.wikimedia.org
+// @connect      raw.githubusercontent.com
 // @run-at       document-start
 // ==/UserScript==
 
